@@ -47,7 +47,7 @@ function createFileCachePlugin(cacheFilePath: string): ICachePlugin {
 }
 
 export class OutlookAuth {
-  static readonly AUTHORITY = 'https://login.microsoftonline.com/consumers';
+  static readonly AUTHORITY = 'https://login.microsoftonline.com/common';
   static readonly SCOPES = ['Mail.ReadWrite', 'Mail.Send', 'offline_access'];
 
   private pca: InstanceType<typeof PublicClientApplication>;
@@ -69,12 +69,15 @@ export class OutlookAuth {
   async getAuthUrl(redirectUri: string): Promise<{ url: string; codeVerifier: string }> {
     const { verifier, challenge } = await this.cryptoProvider.generatePkceCodes();
 
-    const url = await this.pca.getAuthCodeUrl({
+    let url = await this.pca.getAuthCodeUrl({
       scopes: OutlookAuth.SCOPES,
       redirectUri,
       codeChallenge: challenge,
       codeChallengeMethod: 'S256',
     });
+
+    // Force account picker — MSAL strips the prompt param, so append manually
+    url += '&prompt=select_account';
 
     return { url, codeVerifier: verifier };
   }

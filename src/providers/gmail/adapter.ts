@@ -62,7 +62,22 @@ export class GmailAdapter implements EmailProvider {
     const gmail = this.ensureConnected();
     const res = await gmail.users.labels.list({ userId: 'me' });
     const labels = res.data.labels || [];
-    return labels.map(mapGmailLabel);
+
+    // labels.list doesn't include counts — fetch each with labels.get
+    const folders: Folder[] = [];
+    const batchSize = 10;
+    for (let i = 0; i < labels.length; i += batchSize) {
+      const batch = labels.slice(i, i + batchSize);
+      const details = await Promise.all(
+        batch.map((label) =>
+          gmail.users.labels.get({ userId: 'me', id: label.id! })
+        )
+      );
+      for (const detail of details) {
+        folders.push(mapGmailLabel(detail.data));
+      }
+    }
+    return folders;
   }
 
   async createFolder(name: string): Promise<Folder> {
@@ -80,7 +95,7 @@ export class GmailAdapter implements EmailProvider {
 
     const params: any = {
       userId: 'me',
-      maxResults: query.limit || 20,
+      maxResults: query.limit || 200,
     };
 
     if (q) params.q = q;
@@ -91,15 +106,23 @@ export class GmailAdapter implements EmailProvider {
 
     if (messages.length === 0) return [];
 
-    // Fetch full message details for each result
+    // Fetch full message details in parallel batches of 10
     const emails: Email[] = [];
-    for (const msg of messages) {
-      const full = await gmail.users.messages.get({
-        userId: 'me',
-        id: msg.id!,
-        format: 'full',
-      });
-      emails.push(mapGmailMessage(full.data, this.accountId));
+    const batchSize = 10;
+    for (let i = 0; i < messages.length; i += batchSize) {
+      const batch = messages.slice(i, i + batchSize);
+      const results = await Promise.all(
+        batch.map((msg) =>
+          gmail.users.messages.get({
+            userId: 'me',
+            id: msg.id!,
+            format: 'full',
+          })
+        )
+      );
+      for (const full of results) {
+        emails.push(mapGmailMessage(full.data, this.accountId));
+      }
     }
 
     return emails;
@@ -194,11 +217,14 @@ export class GmailAdapter implements EmailProvider {
     const gmail = this.ensureConnected();
     const raw = this.buildRfc2822(params);
 
+    const message: { raw: string; threadId?: string } = { raw };
+    if (params.threadId) {
+      message.threadId = params.threadId;
+    }
+
     const res = await gmail.users.drafts.create({
       userId: 'me',
-      requestBody: {
-        message: { raw },
-      },
+      requestBody: { message },
     });
 
     return { id: res.data.id || '' };
@@ -427,11 +453,25 @@ export class GmailAdapter implements EmailProvider {
     const gmail = this.ensureConnected();
     const res = await gmail.users.labels.list({ userId: 'me' });
     const labels = res.data.labels || [];
-    return labels.map((label: any) => ({
-      id: label.id,
-      name: label.name,
-      messageCount: label.messagesTotal ?? 0,
-    }));
+
+    const results: Array<{ id: string; name: string; messageCount: number }> = [];
+    const batchSize = 10;
+    for (let i = 0; i < labels.length; i += batchSize) {
+      const batch = labels.slice(i, i + batchSize);
+      const details = await Promise.all(
+        batch.map((label: any) =>
+          gmail.users.labels.get({ userId: 'me', id: label.id! })
+        )
+      );
+      for (const detail of details) {
+        results.push({
+          id: detail.data.id!,
+          name: detail.data.name!,
+          messageCount: detail.data.messagesTotal ?? 0,
+        });
+      }
+    }
+    return results;
   }
 
   private buildRfc2822(params: SendEmailParams): string {
