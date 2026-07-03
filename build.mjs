@@ -35,6 +35,14 @@ if (process.argv.includes('--watch')) {
     entryPoints: ['src/setup/wizard.ts'],
   });
 
+  // Build headless watcher-fetch CLI (BCC inbox-watcher Phase B consumer).
+  // esbuild bundles ONLY the entry points listed here — a new src/cli file
+  // that isn't added compiles to nothing, silently.
+  await build({
+    ...shared,
+    entryPoints: ['src/cli/watcher-fetch.ts'],
+  });
+
   // Build CLI entry with shebang
   await build({
     ...shared,

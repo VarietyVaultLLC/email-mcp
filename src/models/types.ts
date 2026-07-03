@@ -49,6 +49,10 @@ export interface Email {
   body: { text?: string; html?: string };
   snippet?: string;
   attachments: AttachmentMeta[];
+  /** Raw provider flag: message HAS attachments even when `attachments` is
+   *  empty (search results don't fetch attachment metadata). Lets headless
+   *  consumers (BCC inbox-watcher) pre-filter before a per-message getEmail. */
+  hasAttachments?: boolean;
   labels?: string[];
   categories?: string[];
   flags: {
