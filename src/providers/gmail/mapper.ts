@@ -133,6 +133,17 @@ export function mapGmailMessage(message: any, accountId: string): Email {
   const body = extractBody(message.payload);
   const attachments = extractAttachments(message.payload);
 
+  // Expose raw RFC headers (lowercased keys) so callers can thread replies.
+  // Without this, `original.headers` was always undefined and email_reply fell
+  // back to `original.id` (the Gmail INTERNAL id, e.g. "19f596951ec56610") as
+  // the In-Reply-To value. That is not an RFC Message-ID, so Gmail could not
+  // match it to the parent and every reply silently started a NEW thread.
+  // (Bug found 2026-07-14: a reply to Dad's "Family Reunion" opened its own thread.)
+  const rawHeaders: Record<string, string> = {};
+  for (const h of headers as Array<{ name?: string; value?: string }>) {
+    if (h?.name) rawHeaders[h.name.toLowerCase()] = h.value ?? '';
+  }
+
   // Determine folder from labels
   let folder = 'INBOX';
   for (const labelId of labelIds) {
@@ -157,6 +168,7 @@ export function mapGmailMessage(message: any, accountId: string): Email {
     snippet: message.snippet,
     attachments,
     labels: labelIds,
+    headers: rawHeaders,
     flags: {
       read: !labelIds.includes('UNREAD'),
       starred: labelIds.includes('STARRED'),

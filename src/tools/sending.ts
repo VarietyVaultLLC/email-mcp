@@ -176,6 +176,10 @@ export function registerSendingTools(server: McpServer, accountManager: AccountM
           body: args.body,
           inReplyTo: messageId,
           references: [messageId],
+          // Gmail threads on threadId, not just In-Reply-To/References. Without
+          // this, replies opened a brand-new conversation. Harmless for Outlook
+          // (which threads via replyToGraphId) and IMAP (header-based).
+          threadId: original.threadId,
           // Outlook's createReply needs the Graph item ID, not the RFC
           // Message-ID. Pass it explicitly so the adapter threads reliably even
           // when headers['message-id'] is present (which would otherwise feed a
