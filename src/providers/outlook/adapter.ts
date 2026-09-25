@@ -134,7 +134,7 @@ export class OutlookAdapter implements EmailProvider {
 
     // When body is not needed, use $select to exclude it — dramatically reduces payload
     if (!query.returnBody) {
-      request = request.select('id,conversationId,parentFolderId,from,toRecipients,ccRecipients,bccRecipients,subject,receivedDateTime,bodyPreview,hasAttachments,isRead,importance,flag,isDraft,categories');
+      request = request.select('id,conversationId,parentFolderId,from,toRecipients,ccRecipients,bccRecipients,subject,receivedDateTime,bodyPreview,hasAttachments,isRead,importance,flag,isDraft,categories,inferenceClassification,webLink');
     }
 
     if (filter) {

@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Forward cc/bcc and original attachments.** `email_forward` takes `cc` and `bcc`, and now carries the original message's attachments (turn off with `includeOriginalAttachments: false`).
 
 - **`email-mcp-fetch`, a headless fetch CLI.** Lists messages since a date as JSON, or saves one attachment to a file, without starting the MCP server, so schedulers and scripts in other languages can read mail through the same accounts and credential store.
+- **`email-mcp-digest`, an unanswered-inbound digest.** Scans every account for threads still waiting on your reply, filters bulk mail deterministically, and emails one digest; settings in `~/.email-mcp/inbound-digest.json`.
+- **More message metadata.** `Email` gains `hasAttachments` (set even when search results carry no attachment list), and Outlook messages carry `inferenceClassification` (Focused Inbox verdict) and `webLink`.
 
 ### Fixed
 - **Replies did not stay in their thread on Gmail and Outlook.** Gmail places a message in a thread only when the API call carries the `threadId`; headers alone start a new conversation. Outlook threads only through Graph's `createReply`, and `/me/sendMail` always started a new conversation. Replies now pass the Gmail `threadId` and go through `createReply` on Outlook (the reply body replaces Graph's pre-filled quote).

@@ -49,10 +49,18 @@ if (process.argv.includes('--watch')) {
     banner: { js: '#!/usr/bin/env node\n' },
   });
 
+  // Unanswered-inbound digest CLI (registered as bin: email-mcp-digest)
+  await build({
+    ...shared,
+    entryPoints: ['src/cli/digest.ts'],
+    banner: { js: '#!/usr/bin/env node\n' },
+  });
+
   // Ensure the CLI entries are executable
   await chmod('dist/index.js', 0o755);
   await chmod('dist/setup/wizard.js', 0o755);
   await chmod('dist/cli/fetch.js', 0o755);
+  await chmod('dist/cli/digest.js', 0o755);
 
   console.log('Build complete.');
 }

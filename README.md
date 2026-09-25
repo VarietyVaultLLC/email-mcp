@@ -199,6 +199,37 @@ email-mcp-fetch --account <id> --download <emailId> <attachmentId> ./file.pdf
 
 List mode prints `[{ id, threadId, from, subject, date, preview, attachments }]`; download mode prints `{ saved, filename, contentType, size }`.
 
+## Unanswered-inbound digest
+
+`email-mcp-digest` scans every configured account for threads where someone else wrote last and you have not replied, and emails you one digest (plain text plus HTML). It is read-only against every mailbox except that one send, needs no model, and skips bulk mail using sender patterns, Gmail's category tabs, Outlook's Focused Inbox verdict and list headers. Run it daily from cron or Task Scheduler.
+
+```bash
+email-mcp-digest --dry-run      # scan and print, send nothing
+email-mcp-digest                # scan and send the digest
+email-mcp-digest --render-only  # re-send from the last report without scanning
+```
+
+Every setting is optional and lives in `~/.email-mcp/inbound-digest.json` (or pass `--config <path>`):
+
+```json
+{
+  "digestFrom": "you@example.com",
+  "digestTo": "you@example.com",
+  "ownAddresses": ["alias@example.com"],
+  "handledTag": "handled",
+  "lookbackDays": 120,
+  "reportPath": "~/.email-mcp/inbound-digest/report.json",
+  "contactsPath": "/path/to/contacts.json",
+  "extraAutomatedDomains": ["vendor-newsletters.example"],
+  "accentColor": "#2F4B7C"
+}
+```
+
+- Your own account addresses always count as "you"; `ownAddresses` adds aliases that are not accounts.
+- Tag a thread with `handledTag` (Outlook category or Gmail label) when you answered it another way, and it drops off. A reply clears it automatically.
+- `contactsPath` points to `{ "contacts": [{ "id", "name", "emails": [], "domains": [] }] }`; matching senders are listed first under "Contacts waiting".
+- Optional `dismissalsPath`, `blockedSendersPath`, `boardUrl`, `dismissUrl` and `scheduleTime` hook the digest into your own triage tooling.
+
 ## Usage with Claude Code
 
 Add the following to your `.mcp.json` file (project-level or global `~/.claude/.mcp.json`):
