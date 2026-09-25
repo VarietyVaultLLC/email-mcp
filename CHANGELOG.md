@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Reply recipients.** `email_reply` takes `to`, `cc`, `bcc` and `additionalRecipients`. Without `to`, replying to a message you sent yourself addressed the reply back to you.
 - **Forward cc/bcc and original attachments.** `email_forward` takes `cc` and `bcc`, and now carries the original message's attachments (turn off with `includeOriginalAttachments: false`).
 
+- **`email-mcp-fetch`, a headless fetch CLI.** Lists messages since a date as JSON, or saves one attachment to a file, without starting the MCP server, so schedulers and scripts in other languages can read mail through the same accounts and credential store.
+
 ### Fixed
 - **Replies did not stay in their thread on Gmail and Outlook.** Gmail places a message in a thread only when the API call carries the `threadId`; headers alone start a new conversation. Outlook threads only through Graph's `createReply`, and `/me/sendMail` always started a new conversation. Replies now pass the Gmail `threadId` and go through `createReply` on Outlook (the reply body replaces Graph's pre-filled quote).
 - **Gmail dropped attachments and sent HTML as plain text.** The Gmail send and draft paths built a single `text/plain` part by hand, so `SendEmailParams.attachments` were ignored and an HTML body arrived as literal markup. Gmail messages and IMAP drafts are now built with nodemailer's MailComposer (already a dependency), which produces the proper multipart structure.

@@ -185,6 +185,20 @@ All batch tools accept a `sourceFolder` parameter for IMAP/iCloud and include a 
 
 Gmail and Outlook only for the rule tools; `email_report_spam`/`email_batch_report_spam` work on every provider (iCloud/IMAP fall back to a best-effort move into the account's Junk-typed folder, with no vendor ML training signal since generic IMAP has none to train).
 
+## Headless fetch (scripts and schedulers)
+
+`email-mcp-fetch` reads mail without starting the MCP server, for cron jobs, schedulers and scripts in other languages. It uses the same credential store as the server, so run it as the user who set the accounts up (or set `EMAIL_MCP_KEY`). It prints JSON on stdout and exits non-zero with the error on stderr.
+
+```bash
+# Messages since a date (add --with-attachments for attachment metadata)
+email-mcp-fetch --account <id> --since 2026-09-01T00:00:00Z --folder inbox --limit 25
+
+# Save one attachment to a file
+email-mcp-fetch --account <id> --download <emailId> <attachmentId> ./file.pdf
+```
+
+List mode prints `[{ id, threadId, from, subject, date, preview, attachments }]`; download mode prints `{ saved, filename, contentType, size }`.
+
 ## Usage with Claude Code
 
 Add the following to your `.mcp.json` file (project-level or global `~/.claude/.mcp.json`):
