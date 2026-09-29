@@ -63,6 +63,13 @@ jobs:
           printf '%s\n' "$SENSITIVE" | sed '/^$/d' > "$RUNNER_TEMP/patterns.txt"
           # grep exits 1 on no match; anything else is an error and fails the step.
           grep -iEf "$RUNNER_TEMP/patterns.txt" "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/sensitive.txt" || [ $? -eq 1 ]
+          # The files API returns at most 3000 files. A list shorter than the PR's
+          # changed-file count hides paths the gate never saw: fail closed.
+          total=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .changed_files)
+          listed=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' | wc -l)
+          if [ "$listed" -lt "$total" ]; then
+            echo "(the files API listed $listed of $total changed files; treat the whole diff as sensitive)" >> "$RUNNER_TEMP/sensitive.txt"
+          fi
           if [ -s "$RUNNER_TEMP/sensitive.txt" ]; then
             d=$(openssl rand -hex 16)
             { echo sensitive=true; echo "files<<$d"; cat "$RUNNER_TEMP/sensitive.txt"; echo "$d"; } >> "$GITHUB_OUTPUT"
