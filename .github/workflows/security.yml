@@ -66,7 +66,7 @@ jobs:
           # The files API returns at most 3000 files. A list shorter than the PR's
           # changed-file count hides paths the gate never saw: fail closed.
           total=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .changed_files)
-          listed=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' | wc -l)
+          listed=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq 'length' | awk '{s+=$1} END {print s+0}')
           if [ "$listed" -lt "$total" ]; then
             echo "(the files API listed $listed of $total changed files; treat the whole diff as sensitive)" >> "$RUNNER_TEMP/sensitive.txt"
           fi
