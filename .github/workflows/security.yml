@@ -10,6 +10,9 @@
 name: security
 on:
   pull_request:
+    # edited: retargeting a PR to another base fires it; without it an old base's
+    # green result stays on the head commit (agent-3 template fix b, 2026-10-01).
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   merge_group:
 permissions:
   contents: read
@@ -116,7 +119,9 @@ jobs:
           # the Verdict step posts the comment.
           github_token: ${{ github.token }}
           # Pull requests the cloud agent (claude.yml) opens get attacked too.
-          allowed_bots: claude
+          # coderabbitai: its description edits fire `edited`; refusing bot actors would
+          # fail closed with no verdict.
+          allowed_bots: claude,coderabbitai
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
