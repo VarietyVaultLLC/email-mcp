@@ -1,0 +1,86 @@
+# Claude (Opus) reviews every pull request. The `review` check ends red when the
+# review finds a blocking defect and green otherwise; on a merge-queue group it
+# passes without a review, because the pull request was reviewed on its way in.
+name: review
+on:
+  pull_request:
+  merge_group:
+permissions:
+  contents: read
+  pull-requests: write
+concurrency:
+  group: review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  review:
+    name: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 1
+
+      - name: Claude reviews the pull request
+        id: claude
+        if: github.event_name == 'pull_request'
+        uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The workflow token, not the Claude app's: the app refuses a workflow
+          # file that is not yet on main, and the review only needs to comment.
+          github_token: ${{ github.token }}
+          # Pull requests the cloud agent (claude.yml) opens get reviewed too.
+          allowed_bots: claude
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request for defects that would ship. The PR branch
+            is checked out in the working directory; `gh pr diff` shows the change.
+            Read CLAUDE.md first: its standing rules and traps are the project's
+            own list of what bites, and breaking one of them is a defect.
+
+            Blocking means: a bug, a regression, a security hole, a secret or key
+            in the change, lost data, or a broken CLAUDE.md standing rule.
+            Style, naming and taste are never blocking.
+
+            For a specific line, use mcp__github_inline_comment__create_inline_comment
+            with confirmed: true. Do not post a top-level comment: return your
+            findings as `report` (markdown) and the workflow posts it as the one
+            "Review: OK" or "Review: BLOCKING" comment.
+
+            Return blocking=true only if at least one finding is blocking.
+          claude_args: |
+            --model claude-opus-5-5
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --json-schema '{"type":"object","properties":{"blocking":{"type":"boolean"},"summary":{"type":"string"},"report":{"type":"string"}},"required":["blocking","summary","report"]}'
+
+      # Fails closed: a missing or unparsable verdict is red, not green. The
+      # comment is edited in place by its prefix, not `--edit-last`: security.yml
+      # comments as the same bot.
+      - name: Verdict
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          VERDICT: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          blocking=$(jq -r 'if (.blocking | type) == "boolean" then .blocking else "none" end' <<<"$VERDICT" 2>/dev/null || echo none)
+          case $blocking in
+            false) head="Review: OK" ;;
+            true) head="Review: BLOCKING" ;;
+            *) head="Review: BLOCKING (no verdict: the review did not finish, so this check fails closed; re-run it)" ;;
+          esac
+          { echo "$head"; echo; jq -r '.report // empty' <<<"$VERDICT" 2>/dev/null || true; } > "$RUNNER_TEMP/review.md"
+          cat "$RUNNER_TEMP/review.md"
+          # The script as committed, not as the working tree now stands: Claude ran
+          # the PR's code in there, and could write files.
+          git show "$GITHUB_SHA:.github/scripts/upsert-comment.sh" > "$RUNNER_TEMP/upsert-comment.sh"
+          bash "$RUNNER_TEMP/upsert-comment.sh" "$PR" "Review:" "$RUNNER_TEMP/review.md"
+          test "$blocking" = false
+
+      - name: Merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "Reviewed on the pull request; nothing to review in the queue."
