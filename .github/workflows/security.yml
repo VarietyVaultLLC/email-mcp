@@ -47,12 +47,11 @@ jobs:
           # auth, money, personal data, secrets, deploy, policy, runtime or
           # hardware by meaning, and either reviewer may raise a PR to it.
           SENSITIVE: |-
-            ^src/auth/
-            ^src/providers/
-            ^src/tools/
-            ^src/cli/
-            ^src/setup/
-            ^src/(index|server|account-manager|oauth-config)\.ts$
+            ^src/
+            ^tests/
+            ^vitest\.config
+            ^tsconfig
+            ^\.npmrc$
             ^build\.mjs$
             ^server\.json$
             ^package(-lock)?\.json$
