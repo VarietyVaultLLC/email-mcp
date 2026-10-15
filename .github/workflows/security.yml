@@ -105,7 +105,10 @@ jobs:
           if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          npm ci
+          # --ignore-scripts: lifecycle scripts of the PR's package.json and lockfile would
+          # run as plain runner steps and could rewrite GITHUB_PATH or GITHUB_ENV for the
+          # steps that hold the secret and decide the verdict.
+          npm ci --ignore-scripts
 
       - name: Claude attacks the pull request
         id: claude
