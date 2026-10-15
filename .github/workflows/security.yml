@@ -52,7 +52,7 @@ jobs:
             ^src/tools/
             ^src/cli/
             ^src/setup/
-            ^src/(index|account-manager|oauth-config)\.ts$
+            ^src/(index|server|account-manager|oauth-config)\.ts$
             ^build\.mjs$
             ^server\.json$
             ^package(-lock)?\.json$
