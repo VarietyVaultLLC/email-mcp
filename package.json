@@ -52,7 +52,7 @@
   "author": "marlinjai",
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
     "@azure/msal-node": "^5.0.4",
@@ -62,7 +62,7 @@
     "googleapis": "^171.4.0",
     "imapflow": "^1.2.9",
     "mailparser": "^3.9.3",
-    "nodemailer": "^8.0.1"
+    "nodemailer": "^10.0.16"
   },
   "devDependencies": {
     "@types/mailparser": "^3.4.6",
@@ -70,6 +70,6 @@
     "@types/nodemailer": "^7.0.10",
     "esbuild": "^0.27.3",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.18"
+    "vitest": "^4.1.11"
   }
 }
