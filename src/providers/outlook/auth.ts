@@ -175,6 +175,15 @@ export class OutlookAuth {
   // Microsoft accounts (not just work/school), not just Mail.ReadWrite/Send.
   static readonly SCOPES = ['Mail.ReadWrite', 'Mail.Send', 'MailboxSettings.ReadWrite', 'offline_access'];
   /**
+   * What silent refresh asks for: the mail scopes every account has
+   * consented to. Asking for SCOPES there made every call fail with
+   * AADSTS65001 (consent required) on work accounts signed in before
+   * MailboxSettings.ReadWrite was added, until they re-ran the wizard. The
+   * token still carries every scope the account has consented to, so the
+   * rule tools work once the wizard has been re-run.
+   */
+  static readonly MAIL_SCOPES = ['Mail.ReadWrite', 'Mail.Send', 'offline_access'];
+  /**
    * Requested separately (incremental consent) so mail keeps working on
    * tokens consented before calendar support existed. Granted once via
    * `node dist/cli/grant-calendar.js`.
@@ -248,7 +257,7 @@ export class OutlookAuth {
    */
   async refreshTokenSilent(
     homeAccountId: string,
-    scopes: string[] = OutlookAuth.SCOPES,
+    scopes: string[] = OutlookAuth.MAIL_SCOPES,
   ): Promise<OutlookAuthResult> {
     const account = await this.pca.getTokenCache().getAccountByHomeId(homeAccountId);
 
@@ -299,7 +308,7 @@ export class OutlookAuth {
   async refreshToken(refreshToken: string): Promise<OutlookAuthResult> {
     const result = await this.pca.acquireTokenByRefreshToken({
       refreshToken,
-      scopes: OutlookAuth.SCOPES,
+      scopes: OutlookAuth.MAIL_SCOPES,
     });
 
     if (!result) {

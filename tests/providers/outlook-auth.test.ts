@@ -5,6 +5,8 @@ import { OutlookAuth } from '../../src/providers/outlook/auth.js';
 const mockGetAuthCodeUrl = vi.fn();
 const mockAcquireTokenByCode = vi.fn();
 const mockAcquireTokenByRefreshToken = vi.fn();
+const mockAcquireTokenSilent = vi.fn();
+const mockGetAccountByHomeId = vi.fn();
 const mockGeneratePkceCodes = vi.fn().mockResolvedValue({
   verifier: 'test-verifier-12345',
   challenge: 'test-challenge-67890',
@@ -17,6 +19,8 @@ vi.mock('@azure/msal-node', () => {
       getAuthCodeUrl = mockGetAuthCodeUrl;
       acquireTokenByCode = mockAcquireTokenByCode;
       acquireTokenByRefreshToken = mockAcquireTokenByRefreshToken;
+      acquireTokenSilent = mockAcquireTokenSilent;
+      getTokenCache = () => ({ getAccountByHomeId: mockGetAccountByHomeId });
     },
     CryptoProvider: class MockCrypto {
       generatePkceCodes = mockGeneratePkceCodes;
@@ -108,7 +112,7 @@ describe('OutlookAuth', () => {
       expect(mockAcquireTokenByRefreshToken).toHaveBeenCalledWith(
         expect.objectContaining({
           refreshToken: 'refresh-token-abc',
-          scopes: ['Mail.ReadWrite', 'Mail.Send', 'MailboxSettings.ReadWrite', 'offline_access'],
+          scopes: ['Mail.ReadWrite', 'Mail.Send', 'offline_access'],
         })
       );
     });
@@ -118,6 +122,19 @@ describe('OutlookAuth', () => {
 
       await expect(auth.refreshToken('bad-token')).rejects.toThrow(
         'Failed to refresh Outlook token'
+      );
+    });
+  });
+
+  describe('refreshTokenSilent', () => {
+    it('asks only for the mail scopes, so accounts consented before MailboxSettings keep working', async () => {
+      mockGetAccountByHomeId.mockResolvedValue({ homeAccountId: 'home-1' });
+      mockAcquireTokenSilent.mockResolvedValue({ accessToken: 'at', expiresOn: null, account: { homeAccountId: 'home-1' } });
+
+      await auth.refreshTokenSilent('home-1');
+
+      expect(mockAcquireTokenSilent).toHaveBeenCalledWith(
+        expect.objectContaining({ scopes: ['Mail.ReadWrite', 'Mail.Send', 'offline_access'] })
       );
     });
   });
