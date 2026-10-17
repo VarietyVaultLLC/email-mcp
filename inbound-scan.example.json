@@ -1,0 +1,14 @@
+{
+  "ownAddresses": [
+    "owner@example.invalid",
+    "owner.shop@example.invalid"
+  ],
+  "digestFrom": "owner.shop@example.invalid",
+  "digestTo": "owner@example.invalid",
+  "digestToName": "Owner",
+  "registryPath": "",
+  "reportPath": "",
+  "dismissalsPath": "",
+  "spamSendersPath": "",
+  "listenerUrl": "http://127.0.0.1:8771"
+}

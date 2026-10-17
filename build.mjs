@@ -36,6 +36,19 @@ if (process.argv.includes('--watch')) {
     banner: { js: '#!/usr/bin/env node\n' },
   });
 
+  // Headless CLIs for scripts and schedulers (no MCP server). esbuild builds
+  // only the entry points listed here: a new src/cli file that is not added
+  // compiles to nothing, silently.
+  await build({
+    ...shared,
+    entryPoints: [
+      'src/cli/watcher-fetch.ts',
+      'src/cli/inbound-scan.ts',
+      'src/cli/jev-fetch.ts',
+      'src/cli/jev-send.ts',
+    ],
+  });
+
   // Build CLI entry with shebang
   await build({
     ...shared,
