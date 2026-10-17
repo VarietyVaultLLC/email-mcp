@@ -174,6 +174,12 @@ export class OutlookAuth {
   // rules) — confirmed by Microsoft's own docs to be supported for personal
   // Microsoft accounts (not just work/school), not just Mail.ReadWrite/Send.
   static readonly SCOPES = ['Mail.ReadWrite', 'Mail.Send', 'MailboxSettings.ReadWrite', 'offline_access'];
+  /**
+   * Requested separately (incremental consent) so mail keeps working on
+   * tokens consented before calendar support existed. Granted once via
+   * `node dist/cli/grant-calendar.js`.
+   */
+  static readonly CALENDAR_SCOPES = ['Calendars.ReadWrite'];
 
   private pca: InstanceType<typeof PublicClientApplication>;
   private cryptoProvider: InstanceType<typeof CryptoProvider>;
@@ -191,13 +197,16 @@ export class OutlookAuth {
     this.cryptoProvider = new CryptoProvider();
   }
 
-  async getAuthUrl(redirectUri: string): Promise<{ url: string; codeVerifier: string; state: string }> {
+  async getAuthUrl(
+    redirectUri: string,
+    scopes: string[] = OutlookAuth.SCOPES,
+  ): Promise<{ url: string; codeVerifier: string; state: string }> {
     const { verifier, challenge } = await this.cryptoProvider.generatePkceCodes();
     // CSRF binding, verified by OAuthCallbackServer.waitForCode(state).
     const state = crypto.randomBytes(16).toString('base64url');
 
     const url = await this.pca.getAuthCodeUrl({
-      scopes: OutlookAuth.SCOPES,
+      scopes,
       redirectUri,
       codeChallenge: challenge,
       codeChallengeMethod: 'S256',
@@ -213,12 +222,13 @@ export class OutlookAuth {
   async exchangeCode(
     code: string,
     codeVerifier: string,
-    redirectUri: string
+    redirectUri: string,
+    scopes: string[] = OutlookAuth.SCOPES,
   ): Promise<OutlookAuthResult> {
     const result: AuthenticationResult = await this.pca.acquireTokenByCode({
       code,
       codeVerifier,
-      scopes: OutlookAuth.SCOPES,
+      scopes,
       redirectUri,
     });
 
@@ -236,7 +246,10 @@ export class OutlookAuth {
    * This is the preferred refresh method — it uses the cached refresh token
    * automatically via acquireTokenSilent().
    */
-  async refreshTokenSilent(homeAccountId: string): Promise<OutlookAuthResult> {
+  async refreshTokenSilent(
+    homeAccountId: string,
+    scopes: string[] = OutlookAuth.SCOPES,
+  ): Promise<OutlookAuthResult> {
     const account = await this.pca.getTokenCache().getAccountByHomeId(homeAccountId);
 
     if (!account) {
@@ -247,7 +260,7 @@ export class OutlookAuth {
 
     const result = await this.pca.acquireTokenSilent({
       account,
-      scopes: OutlookAuth.SCOPES,
+      scopes,
     });
 
     return {

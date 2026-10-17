@@ -46,6 +46,8 @@ if (process.argv.includes('--watch')) {
       'src/cli/inbound-scan.ts',
       'src/cli/jev-fetch.ts',
       'src/cli/jev-send.ts',
+      // One-time Calendars.ReadWrite consent for email_calendar_event_create.
+      'src/cli/grant-calendar.ts',
     ],
   });
 
