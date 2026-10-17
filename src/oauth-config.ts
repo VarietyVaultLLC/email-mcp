@@ -3,6 +3,6 @@
 // Same pattern as GitHub CLI, VS Code, Firebase CLI, etc.
 
 export const GMAIL_CLIENT_ID =
-  '1062266096576-lu2ukplhc3lcm0bvheml5i18urptdp4t.apps.googleusercontent.com';
-export const GMAIL_CLIENT_SECRET = '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';
+  'REDACTED-private-client-id.apps.googleusercontent.com';
+export const GMAIL_CLIENT_SECRET = 'REDACTED-private-client-secret';
 export const OUTLOOK_CLIENT_ID = '76d32225-ef10-4b49-951c-c80ae906595d';

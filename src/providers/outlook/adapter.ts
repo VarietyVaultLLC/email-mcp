@@ -125,7 +125,7 @@ export class OutlookAdapter implements EmailProvider {
 
     // When body is not needed, use $select to exclude it — dramatically reduces payload
     if (!query.returnBody) {
-      request = request.select('id,conversationId,parentFolderId,from,toRecipients,ccRecipients,bccRecipients,subject,receivedDateTime,bodyPreview,hasAttachments,isRead,importance,flag,isDraft,categories');
+      request = request.select('id,conversationId,parentFolderId,from,toRecipients,ccRecipients,bccRecipients,subject,receivedDateTime,bodyPreview,hasAttachments,isRead,importance,flag,isDraft,categories,inferenceClassification,webLink');
     }
 
     if (filter) {
@@ -141,7 +141,10 @@ export class OutlookAdapter implements EmailProvider {
       request = request.skip(query.offset);
     }
 
-    request = request.orderby('receivedDateTime desc');
+    // Graph API does not allow $orderBy when $search is used
+    if (!search) {
+      request = request.orderby('receivedDateTime desc');
+    }
 
     const response = await request.get();
     return (response.value || []).map((msg: any) => mapGraphMessage(msg, this.accountId));
@@ -207,6 +210,56 @@ export class OutlookAdapter implements EmailProvider {
 
   async sendEmail(params: SendEmailParams): Promise<{ id: string; threadId?: string }> {
     const client = this.ensureClient();
+
+    // True in-thread reply: Graph only threads (preserves conversationId,
+    // subject, quoted history) via the createReply draft flow. /sendMail
+    // always forks a new conversation regardless of inReplyTo. So when this
+    // is a reply, create a reply draft off the original message, overlay our
+    // body/recipients/attachments, then send the draft.
+    if (params.inReplyTo) {
+      // createReply requires the Graph item ID. Prefer replyToGraphId (the
+      // tool layer sets it to original.id); fall back to inReplyTo only if it
+      // wasn't provided (legacy callers).
+      const origId = encodeURIComponent(params.replyToGraphId ?? params.inReplyTo);
+      const draft = await client
+        .api(`/me/messages/${origId}/createReply`)
+        .post({});
+
+      const bodyContent = params.body.html || params.body.text || '';
+      const contentType = params.body.html ? 'html' : 'text';
+      const toGraphRecipient = (c: { name?: string; email: string }) => ({
+        emailAddress: { name: c.name, address: c.email },
+      });
+
+      const patch: any = {
+        body: { contentType, content: bodyContent },
+      };
+      // Only override recipients if explicitly provided; otherwise keep the
+      // recipients Graph pre-populated on the reply draft (original sender).
+      if (params.to?.length) patch.toRecipients = params.to.map(toGraphRecipient);
+      if (params.cc?.length) patch.ccRecipients = params.cc.map(toGraphRecipient);
+      if (params.bcc?.length) patch.bccRecipients = params.bcc.map(toGraphRecipient);
+
+      await client.api(`/me/messages/${encodeURIComponent(draft.id)}`).patch(patch);
+
+      if (params.attachments?.length) {
+        for (const att of params.attachments) {
+          await client
+            .api(`/me/messages/${encodeURIComponent(draft.id)}/attachments`)
+            .post({
+              '@odata.type': '#microsoft.graph.fileAttachment',
+              name: att.filename,
+              contentType: att.contentType,
+              contentBytes: att.content.toString('base64'),
+            });
+        }
+      }
+
+      await client.api(`/me/messages/${encodeURIComponent(draft.id)}/send`).post({});
+      return { id: draft.id };
+    }
+
+    // Fresh email (no thread to reply into): plain sendMail.
     const message = this.buildGraphMessage(params);
 
     const payload: any = { message };
@@ -226,8 +279,62 @@ export class OutlookAdapter implements EmailProvider {
 
   async createDraft(params: SendEmailParams): Promise<{ id: string }> {
     const client = this.ensureClient();
-    const message = this.buildGraphMessage(params);
 
+    // True in-thread reply DRAFT: same as the sendEmail reply path (createReply
+    // preserves conversationId/subject/quoted-history), but we STOP before the
+    // /send call and leave the draft in place. A plain POST to /me/messages
+    // forks a NEW conversation regardless of In-Reply-To headers, which is why
+    // header-only threading silently failed on Outlook (orphaned draft, 2026-06-01).
+    const replyGraphId = params.replyToGraphId ?? params.inReplyTo;
+    if (replyGraphId) {
+      const origId = encodeURIComponent(replyGraphId);
+      const draft = await client
+        .api(`/me/messages/${origId}/createReply`)
+        .post({});
+
+      const bodyContent = params.body.html || params.body.text || '';
+      const contentType = params.body.html ? 'html' : 'text';
+      const toGraphRecipient = (c: { name?: string; email: string }) => ({
+        emailAddress: { name: c.name, address: c.email },
+      });
+
+      const patch: any = {
+        body: { contentType, content: bodyContent },
+      };
+      // Override the Graph-prepopulated recipients only when explicitly given.
+      if (params.to?.length) patch.toRecipients = params.to.map(toGraphRecipient);
+      if (params.cc?.length) patch.ccRecipients = params.cc.map(toGraphRecipient);
+      if (params.bcc?.length) patch.bccRecipients = params.bcc.map(toGraphRecipient);
+
+      await client.api(`/me/messages/${encodeURIComponent(draft.id)}`).patch(patch);
+
+      if (params.attachments?.length) {
+        for (const att of params.attachments) {
+          await client
+            .api(`/me/messages/${encodeURIComponent(draft.id)}/attachments`)
+            .post({
+              '@odata.type': '#microsoft.graph.fileAttachment',
+              name: att.filename,
+              contentType: att.contentType,
+              contentBytes: att.content.toString('base64'),
+            });
+        }
+      }
+
+      // NO /send — leave it as a draft in the original conversation.
+      return { id: draft.id };
+    }
+
+    // Fresh (non-reply) draft: plain message create.
+    const message = this.buildGraphMessage(params);
+    if (params.attachments?.length) {
+      message.attachments = params.attachments.map((att) => ({
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        name: att.filename,
+        contentType: att.contentType,
+        contentBytes: att.content.toString('base64'),
+      }));
+    }
     const result = await client.api('/me/messages').post(message);
     return { id: result.id };
   }

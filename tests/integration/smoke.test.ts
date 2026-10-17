@@ -85,8 +85,10 @@ describe('Smoke test', () => {
     const tools = (server as any)._registeredTools;
     const toolNames = Object.keys(tools);
 
-    // 4 account + 5 reading + 5 sending + 10 organizing (7 original + 3 batch) = 24
-    expect(toolNames.length).toBe(24);
+    // 4 account + 5 reading + 5 sending + 10 organizing (7 original + 3 batch)
+    // + 1 calendar (email_calendar_event_create) = 25
+    expect(toolNames.length).toBe(25);
+    expect(tools).toHaveProperty('email_calendar_event_create');
   });
 
   it('all registered tool names start with email_ prefix', async () => {

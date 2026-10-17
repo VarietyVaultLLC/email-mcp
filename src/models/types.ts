@@ -49,8 +49,19 @@ export interface Email {
   body: { text?: string; html?: string };
   snippet?: string;
   attachments: AttachmentMeta[];
+  /** Raw provider flag: message HAS attachments even when `attachments` is
+   *  empty (search results don't fetch attachment metadata). Lets headless
+   *  consumers (BCC inbox-watcher) pre-filter before a per-message getEmail. */
+  hasAttachments?: boolean;
   labels?: string[];
   categories?: string[];
+  /** Outlook Focused-inbox verdict: 'focused' | 'other'. 'other' = Outlook's
+   *  own bulk/clutter classification — used by inbound-scan to drop
+   *  newsletters. Absent on Gmail/IMAP. */
+  inferenceClassification?: string;
+  /** OWA deep link to open this message in the browser (Outlook only). Used
+   *  to show Jon the actual email before asking him about it. */
+  webLink?: string;
   flags: {
     read: boolean;
     starred: boolean;

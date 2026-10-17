@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import type { AccountCredentials } from '../models/types.js';
+import { atomicWriteFileSync, sleepSync, withLock } from './atomic-file.js';
 
 const ALGORITHM = 'aes-256-gcm';
 const KEY_LENGTH = 32;
@@ -51,6 +52,11 @@ interface StoredData {
   accounts: Record<string, AccountCredentials>;
 }
 
+/** Stale threshold for the credentials.enc lock (see atomic-file.ts withLock). */
+const CREDENTIALS_LOCK_STALE_MS = 10_000;
+const READ_RETRY_ATTEMPTS = 5;
+const READ_RETRY_DELAY_MS = 50;
+
 export class CredentialStore {
   private filePath: string;
 
@@ -66,21 +72,37 @@ export class CredentialStore {
     if (!fs.existsSync(this.filePath)) {
       return { accounts: {} };
     }
-    const raw = fs.readFileSync(this.filePath, 'utf-8');
-    const json = decrypt(raw);
-    return JSON.parse(json);
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= READ_RETRY_ATTEMPTS; attempt++) {
+      try {
+        const raw = fs.readFileSync(this.filePath, 'utf-8');
+        if (raw.length === 0) {
+          throw new Error('credentials file is empty');
+        }
+        const json = decrypt(raw);
+        return JSON.parse(json);
+      } catch (err) {
+        lastErr = err;
+        if (attempt < READ_RETRY_ATTEMPTS) {
+          sleepSync(READ_RETRY_DELAY_MS);
+        }
+      }
+    }
+    throw lastErr;
   }
 
   private write(data: StoredData): void {
     const json = JSON.stringify(data);
     const encrypted = encrypt(json);
-    fs.writeFileSync(this.filePath, encrypted, { mode: 0o600 });
+    atomicWriteFileSync(this.filePath, encrypted, 0o600);
   }
 
   async save(creds: AccountCredentials): Promise<void> {
-    const data = this.read();
-    data.accounts[creds.id] = creds;
-    this.write(data);
+    withLock(this.filePath, CREDENTIALS_LOCK_STALE_MS, () => {
+      const data = this.read();
+      data.accounts[creds.id] = creds;
+      this.write(data);
+    });
   }
 
   async get(id: string): Promise<AccountCredentials | null> {
@@ -94,8 +116,10 @@ export class CredentialStore {
   }
 
   async remove(id: string): Promise<void> {
-    const data = this.read();
-    delete data.accounts[id];
-    this.write(data);
+    withLock(this.filePath, CREDENTIALS_LOCK_STALE_MS, () => {
+      const data = this.read();
+      delete data.accounts[id];
+      this.write(data);
+    });
   }
 }

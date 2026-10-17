@@ -123,6 +123,33 @@ export class AccountManager {
     }
   }
 
+  /**
+   * Access token carrying Calendars.ReadWrite for an Outlook account. Uses
+   * incremental consent: the mail token is untouched, and until the calendar
+   * scope has been granted once this throws with the command that grants it.
+   */
+  async getOutlookCalendarToken(accountId: string): Promise<string> {
+    const creds = await this.store.get(accountId);
+    if (!creds) throw new Error(`Account ${accountId} not found`);
+    if (creds.provider !== ProviderType.Outlook) {
+      throw new Error('Calendar tools are only supported on Outlook accounts');
+    }
+    const homeAccountId = creds.oauth?.msal_home_account_id;
+    if (!homeAccountId) {
+      throw new Error('Outlook account has no MSAL account ID; re-authenticate via setup wizard');
+    }
+    try {
+      const outlookAuth = new OutlookAuth(OUTLOOK_CLIENT_ID);
+      const result = await outlookAuth.refreshTokenSilent(homeAccountId, OutlookAuth.CALENDAR_SCOPES);
+      return result.accessToken;
+    } catch (error: any) {
+      throw new Error(
+        `Calendar permission not granted for ${creds.email} yet (${error.message}). ` +
+          'Grant it once with: node dist/cli/grant-calendar.js (from the email-mcp folder)'
+      );
+    }
+  }
+
   private async refreshTokenIfNeeded(creds: AccountCredentials): Promise<void> {
     if (!creds.oauth?.expiry) return;
 

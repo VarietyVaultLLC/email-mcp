@@ -6,3 +6,4 @@ credentials.enc
 .mcp.json
 .mcpregistry_*
 config/
+*.worker-bundle.mjs

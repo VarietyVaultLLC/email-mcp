@@ -19,6 +19,12 @@ export interface SendEmailParams {
   attachments?: Array<{ filename: string; content: Buffer; contentType: string }>;
   inReplyTo?: string;
   references?: string[];
+  threadId?: string;
+  // Graph item ID of the message being replied to (Outlook only). Distinct from
+  // inReplyTo (the RFC Message-ID used for header-based threading on Gmail/IMAP).
+  // Outlook's createReply flow needs the Graph item ID, NOT the RFC Message-ID,
+  // so it's passed separately. Gmail/IMAP ignore this field.
+  replyToGraphId?: string;
 }
 
 export interface EmailProvider {

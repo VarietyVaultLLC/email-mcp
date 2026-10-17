@@ -1,6 +1,7 @@
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import type { gmail_v1 } from 'googleapis';
+import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type { EmailProvider, SendEmailParams } from '../provider.js';
 import type {
   Email,
@@ -62,7 +63,22 @@ export class GmailAdapter implements EmailProvider {
     const gmail = this.ensureConnected();
     const res = await gmail.users.labels.list({ userId: 'me' });
     const labels = res.data.labels || [];
-    return labels.map(mapGmailLabel);
+
+    // labels.list doesn't include counts — fetch each with labels.get
+    const folders: Folder[] = [];
+    const batchSize = 10;
+    for (let i = 0; i < labels.length; i += batchSize) {
+      const batch = labels.slice(i, i + batchSize);
+      const details = await Promise.all(
+        batch.map((label) =>
+          gmail.users.labels.get({ userId: 'me', id: label.id! })
+        )
+      );
+      for (const detail of details) {
+        folders.push(mapGmailLabel(detail.data));
+      }
+    }
+    return folders;
   }
 
   async createFolder(name: string): Promise<Folder> {
@@ -80,7 +96,7 @@ export class GmailAdapter implements EmailProvider {
 
     const params: any = {
       userId: 'me',
-      maxResults: query.limit || 20,
+      maxResults: query.limit || 200,
     };
 
     if (q) params.q = q;
@@ -91,15 +107,23 @@ export class GmailAdapter implements EmailProvider {
 
     if (messages.length === 0) return [];
 
-    // Fetch full message details for each result
+    // Fetch full message details in parallel batches of 10
     const emails: Email[] = [];
-    for (const msg of messages) {
-      const full = await gmail.users.messages.get({
-        userId: 'me',
-        id: msg.id!,
-        format: 'full',
-      });
-      emails.push(mapGmailMessage(full.data, this.accountId));
+    const batchSize = 10;
+    for (let i = 0; i < messages.length; i += batchSize) {
+      const batch = messages.slice(i, i + batchSize);
+      const results = await Promise.all(
+        batch.map((msg) =>
+          gmail.users.messages.get({
+            userId: 'me',
+            id: msg.id!,
+            format: 'full',
+          })
+        )
+      );
+      for (const full of results) {
+        emails.push(mapGmailMessage(full.data, this.accountId));
+      }
     }
 
     return emails;
@@ -177,11 +201,20 @@ export class GmailAdapter implements EmailProvider {
 
   async sendEmail(params: SendEmailParams): Promise<{ id: string; threadId?: string }> {
     const gmail = this.ensureConnected();
-    const raw = this.buildRfc2822(params);
+    const raw = await this.buildRfc2822(params);
+
+    // Pass threadId so the sent message joins the parent conversation. Header
+    // threading (In-Reply-To/References) alone is not sufficient on the Gmail
+    // API, and createDraft has always done this while sendEmail did not, so
+    // replies sent via email_reply silently started new threads.
+    const requestBody: { raw: string; threadId?: string } = { raw };
+    if (params.threadId) {
+      requestBody.threadId = params.threadId;
+    }
 
     const res = await gmail.users.messages.send({
       userId: 'me',
-      requestBody: { raw },
+      requestBody,
     });
 
     return {
@@ -192,13 +225,16 @@ export class GmailAdapter implements EmailProvider {
 
   async createDraft(params: SendEmailParams): Promise<{ id: string }> {
     const gmail = this.ensureConnected();
-    const raw = this.buildRfc2822(params);
+    const raw = await this.buildRfc2822(params);
+
+    const message: { raw: string; threadId?: string } = { raw };
+    if (params.threadId) {
+      message.threadId = params.threadId;
+    }
 
     const res = await gmail.users.drafts.create({
       userId: 'me',
-      requestBody: {
-        message: { raw },
-      },
+      requestBody: { message },
     });
 
     return { id: res.data.id || '' };
@@ -427,37 +463,68 @@ export class GmailAdapter implements EmailProvider {
     const gmail = this.ensureConnected();
     const res = await gmail.users.labels.list({ userId: 'me' });
     const labels = res.data.labels || [];
-    return labels.map((label: any) => ({
-      id: label.id,
-      name: label.name,
-      messageCount: label.messagesTotal ?? 0,
-    }));
+
+    const results: Array<{ id: string; name: string; messageCount: number }> = [];
+    const batchSize = 10;
+    for (let i = 0; i < labels.length; i += batchSize) {
+      const batch = labels.slice(i, i + batchSize);
+      const details = await Promise.all(
+        batch.map((label: any) =>
+          gmail.users.labels.get({ userId: 'me', id: label.id! })
+        )
+      );
+      for (const detail of details) {
+        results.push({
+          id: detail.data.id!,
+          name: detail.data.name!,
+          messageCount: detail.data.messagesTotal ?? 0,
+        });
+      }
+    }
+    return results;
   }
 
-  private buildRfc2822(params: SendEmailParams): string {
-    const lines: string[] = [];
-    lines.push(`From: ${this.email}`);
-    lines.push(
-      `To: ${params.to.map((c) => (c.name ? `"${c.name}" <${c.email}>` : c.email)).join(', ')}`,
-    );
-    if (params.cc?.length) {
-      lines.push(`Cc: ${params.cc.map((c) => c.email).join(', ')}`);
-    }
-    if (params.bcc?.length) {
-      lines.push(`Bcc: ${params.bcc.map((c) => c.email).join(', ')}`);
-    }
-    lines.push(`Subject: ${params.subject}`);
-    if (params.inReplyTo) {
-      lines.push(`In-Reply-To: ${params.inReplyTo}`);
-    }
-    if (params.references?.length) {
-      lines.push(`References: ${params.references.join(' ')}`);
-    }
-    lines.push('MIME-Version: 1.0');
-    lines.push('Content-Type: text/plain; charset=UTF-8');
-    lines.push('');
-    lines.push(params.body.text || params.body.html || '');
+  /**
+   * Build the base64url RFC822 payload Gmail's API expects for `raw`.
+   *
+   * This used to be hand-rolled and hardcoded a single `text/plain` part. Two
+   * bugs fell out of that, both silent (no error, API returned success):
+   *   1. `params.attachments` was NEVER read, so every attachment sent through
+   *      Gmail was dropped on the floor. (Found 2026-07-14: an email went to
+   *      Jon's dad saying "reviewed versions attached" with nothing attached.)
+   *   2. An HTML body was stuffed into a text/plain part, so recipients saw raw
+   *      markup instead of rendered HTML (this broke the VV branded signature).
+   *
+   * Now delegated to nodemailer's MailComposer, which is already a production
+   * dependency and is what the IMAP/SMTP path has always used. It produces the
+   * correct multipart/mixed + multipart/alternative tree, base64-encodes
+   * attachments, and RFC 2047-encodes non-ASCII headers.
+   */
+  private async buildRfc2822(params: SendEmailParams): Promise<string> {
+    const composer = new MailComposer({
+      from: this.email,
+      to: params.to.map((c) => (c.name ? `"${c.name}" <${c.email}>` : c.email)).join(', '),
+      cc: params.cc?.length ? params.cc.map((c) => c.email).join(', ') : undefined,
+      bcc: params.bcc?.length ? params.bcc.map((c) => c.email).join(', ') : undefined,
+      subject: params.subject,
+      text: params.body.text,
+      html: params.body.html,
+      inReplyTo: params.inReplyTo,
+      references: params.references?.length ? params.references.join(' ') : undefined,
+      attachments: params.attachments?.map((a) => ({
+        filename: a.filename,
+        content: a.content,
+        contentType: a.contentType,
+      })),
+    });
 
-    return Buffer.from(lines.join('\r\n')).toString('base64url');
+    const message: Buffer = await new Promise((resolve, reject) => {
+      composer.compile().build((err: Error | null, buf: Buffer) => {
+        if (err) reject(err);
+        else resolve(buf);
+      });
+    });
+
+    return message.toString('base64url');
   }
 }

@@ -5,12 +5,12 @@ description: Clean junk mail across all email accounts — classify, rescue, sor
 
 # Clean My Email
 
-You are an email triage assistant. Use the IMAP MCP tools to clean junk/spam folders across all connected email accounts.
+You are an email triage assistant. Use the email MCP tools to clean junk/spam folders across all connected email accounts.
 
 ## Setup
 
-- **Blocklist location:** `config/blocklist.json` in this project directory (`/Users/marlinjai/software dev/clean-my-email/`)
-- **MCP Server:** `imap` (nikolausm/imap-mcp-server with multi-account support)
+- **Blocklist location:** `config/blocklist.json` in this repo (`~/Documents/email-mcp/`). If it doesn't exist yet, create it as `{"blocked_domains": [], "last_updated": null, "stats": {}}`.
+- **MCP Server:** `email-mcp` (this repo — tools are named `email_*`)
 
 ## Workflow
 
@@ -20,36 +20,36 @@ Read `config/blocklist.json` from the project directory. This contains domains w
 
 ### 2. Connect to all accounts
 
-Use `imap_list_accounts` to see available accounts. For each account, use `imap_connect` to ensure it's connected.
+Use `email_list_accounts` to see available accounts. If an account shows `connected: false`, run `email_test_account` — the cached flag drifts; the live test is the truth.
 
 ### 3. For each account, process junk/spam folder
 
-Use `imap_list_folders` to find the junk/spam folder for the account. Common names:
+Use `email_list_folders` to find the junk/spam folder for the account. Common names:
 - Gmail: `[Gmail]/Spam`
 - iCloud: `Junk`
 - Outlook: `Junk Email`
 
-Use `imap_search_emails` on the junk/spam folder to get recent emails (last 7 days). If there are many, process in batches of 20.
+Use `email_search` (with `folder` + `since`) on the junk/spam folder to get recent emails (last 7 days). If there are many, process in batches of 20.
 
 ### 4. Pre-filter: Auto-delete blocklisted domains
 
-For each email, extract the sender's domain. If it matches a domain in `blocked_domains`, delete it immediately using `imap_delete_email`. Count these as "auto-deleted".
+For each email, extract the sender's domain. If it matches a domain in `blocked_domains`, delete it immediately using `email_batch_delete` (pass `sourceFolder` for IMAP/iCloud). Count these as "auto-deleted".
 
 ### 5. Classify remaining emails
 
-For each remaining email, use `imap_get_email` to read its content. Classify it into one of:
+For each remaining email, use `email_get` to read its content. Classify it into one of:
 
 - **JUNK**: Obvious spam, scams, phishing, unwanted marketing from unknown senders
-  → Delete using `imap_delete_email`
+  → Delete using `email_delete` (pass `sourceFolder` for IMAP/iCloud)
   → Add sender domain to `blocked_domains` in blocklist
 
 - **NOT JUNK**: Legitimate email that was incorrectly flagged as spam
-  → Use `imap_send_email` to forward the email content to the user's own inbox address with subject prefix "[Rescued from Spam] "
-  → Delete the original from spam using `imap_delete_email`
+  → Use `email_forward` to forward it to the user's own inbox address with subject prefix "[Rescued from Spam] "
+  → Delete the original from spam using `email_delete`
   → Print a summary: sender, subject, brief description of contents
 
 - **PROMOTION/NEWSLETTER**: Legitimate promotional or newsletter content
-  → Use `imap_list_folders` to find a matching promotions folder
+  → Use `email_list_folders` to find a matching promotions folder
   → If a matching folder exists and move is possible, describe what folder it belongs in
   → If no matching folder, leave it and note it in the report
   → Do NOT add to blocklist (these are opted-in)

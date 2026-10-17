@@ -182,24 +182,26 @@ Once configured, you can ask Claude to interact with your email:
 
 ## Development
 
+> **This checkout is a local fork deployed live from `dist/`** (Claude Code launches it via `wrapper.mjs`). It uses **npm** (`package-lock.json`), not pnpm. After any rebuild, fully restart Claude Code — an MCP reconnect is not sufficient.
+
 ```bash
 # Install dependencies
-pnpm install
+npm install
 
 # Build the project
-pnpm build
+npm run build
 
 # Run in development mode (watch for changes)
-pnpm dev
+npm run dev
 
 # Run tests
-pnpm test
+npm test
 
 # Run tests in watch mode
-pnpm test:watch
+npm run test:watch
 
 # Run integration tests (requires real email accounts)
-pnpm test:integration
+npm run test:integration
 ```
 
 ## Support

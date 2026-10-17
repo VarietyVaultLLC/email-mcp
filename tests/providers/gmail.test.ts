@@ -359,6 +359,119 @@ describe('GmailAdapter', () => {
     });
   });
 
+  // Regression tests for the 2026-07-14 Gmail send-path bugs. The pre-existing
+  // sendEmail test above only asserted `raw: expect.any(String)`, which passed
+  // happily while attachments were being dropped on the floor. These decode the
+  // actual MIME and assert on its contents.
+  describe('MIME construction (regression: silent attachment + html loss)', () => {
+    const lastSentMime = (): string => {
+      const call = mockMessagesSend.mock.calls.at(-1)?.[0];
+      return Buffer.from(call.requestBody.raw, 'base64url').toString('utf8');
+    };
+
+    it('includes attachments in the outgoing MIME', async () => {
+      await adapter.sendEmail({
+        to: [{ email: 'dad@example.com' }],
+        subject: 'Reviewed files',
+        body: { text: 'Attached.' },
+        attachments: [
+          {
+            filename: 'Details_to_family_REVIEWED.docx',
+            content: Buffer.from('PK-fake-docx-bytes'),
+            contentType:
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          },
+        ],
+      });
+
+      const mime = lastSentMime();
+      expect(mime).toContain('multipart/mixed');
+      expect(mime).toContain('Details_to_family_REVIEWED.docx');
+      expect(mime).toContain('Content-Disposition: attachment');
+      // The bytes must actually be carried, base64-encoded.
+      expect(mime).toContain(Buffer.from('PK-fake-docx-bytes').toString('base64'));
+    });
+
+    it('carries multiple attachments', async () => {
+      await adapter.sendEmail({
+        to: [{ email: 'dad@example.com' }],
+        subject: 'Two files',
+        body: { text: 'Both attached.' },
+        attachments: [
+          { filename: 'a.docx', content: Buffer.from('aaa'), contentType: 'application/msword' },
+          { filename: 'b.xlsx', content: Buffer.from('bbb'), contentType: 'application/vnd.ms-excel' },
+        ],
+      });
+
+      const mime = lastSentMime();
+      expect(mime).toContain('a.docx');
+      expect(mime).toContain('b.xlsx');
+    });
+
+    it('sends an HTML body as text/html, not as raw markup in text/plain', async () => {
+      await adapter.sendEmail({
+        to: [{ email: 'customer@example.com' }],
+        subject: 'Branded',
+        body: { html: '<div id="sig">Variety Vault 3D</div>' },
+      });
+
+      const mime = lastSentMime();
+      expect(mime).toContain('text/html');
+      // Previously the markup was dumped into a text/plain part, so the
+      // recipient saw the literal tags.
+      expect(mime).not.toMatch(/Content-Type: text\/plain[\s\S]*?<div id="sig">/);
+    });
+
+    it('sends text+html as multipart/alternative', async () => {
+      await adapter.sendEmail({
+        to: [{ email: 'customer@example.com' }],
+        subject: 'Both',
+        body: { text: 'plain fallback', html: '<p>rich</p>' },
+      });
+
+      const mime = lastSentMime();
+      expect(mime).toContain('multipart/alternative');
+      expect(mime).toContain('text/plain');
+      expect(mime).toContain('text/html');
+    });
+
+    it('passes threadId to the API so replies join the parent conversation', async () => {
+      await adapter.sendEmail({
+        to: [{ email: 'dad@example.com' }],
+        subject: 'Re: Family Reunion',
+        body: { text: 'reply' },
+        inReplyTo: '<parent@mail.gmail.com>',
+        references: ['<parent@mail.gmail.com>'],
+        threadId: 'thread-parent-1',
+      });
+
+      expect(mockMessagesSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestBody: expect.objectContaining({ threadId: 'thread-parent-1' }),
+        }),
+      );
+      expect(lastSentMime()).toContain('In-Reply-To: <parent@mail.gmail.com>');
+    });
+
+    it('omits threadId when not replying', async () => {
+      await adapter.sendEmail({
+        to: [{ email: 'new@example.com' }],
+        subject: 'Fresh',
+        body: { text: 'new thread' },
+      });
+
+      const call = mockMessagesSend.mock.calls.at(-1)?.[0];
+      expect(call.requestBody.threadId).toBeUndefined();
+    });
+
+    it('exposes the RFC Message-ID header so email_reply can thread', async () => {
+      const email = await adapter.getEmail('msg-123');
+      // Without this the reply path fell back to the Gmail internal id and set
+      // a bogus In-Reply-To, so every reply opened a new thread.
+      expect(email.headers?.['message-id']).toBe('<msg-123@example.com>');
+    });
+  });
+
   describe('createDraft', () => {
     it('creates draft via Gmail API', async () => {
       const result = await adapter.createDraft({
