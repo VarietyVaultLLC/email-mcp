@@ -1,9 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { CredentialStore } from '../../src/auth/credential-store.js';
 import { ProviderType } from '../../src/models/types.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+import { build } from 'esbuild';
 
 describe('CredentialStore', () => {
   let store: CredentialStore;
@@ -233,4 +236,106 @@ describe('CredentialStore', () => {
       await expect(s2.get('wrong-1')).rejects.toThrow();
     });
   });
+});
+
+// Several server processes and CLI tools share credentials.enc. These tests
+// cover the cross-process lock and atomic write, using a worker bundled with
+// esbuild and spawned as a real, separate OS process.
+const WORKER_SRC_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'concurrent-save-worker.ts');
+
+describe('CredentialStore under concurrent writers', () => {
+  let store: CredentialStore;
+  let testDir: string;
+  let workerBundlePath: string;
+
+  beforeAll(async () => {
+    workerBundlePath = path.join(os.tmpdir(), `email-mcp-concurrent-save-worker-${process.pid}.mjs`);
+    await build({
+      entryPoints: [WORKER_SRC_PATH],
+      outfile: workerBundlePath,
+      bundle: true,
+      platform: 'node',
+      format: 'esm',
+      target: 'node20',
+    });
+  }, 30_000);
+
+  afterAll(() => {
+    if (workerBundlePath) fs.rmSync(workerBundlePath, { force: true });
+  });
+
+  beforeEach(() => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'email-mcp-lock-test-'));
+    store = new CredentialStore(testDir);
+  });
+
+  afterEach(() => {
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  const account = (id: string) => ({
+    id,
+    name: id,
+    provider: ProviderType.Gmail as const,
+    email: `${id}@example.com`,
+    oauth: { access_token: 'a', refresh_token: 'r', expiry: '' },
+  });
+
+  function spawnSaveWorker(dir: string, accountId: string): Promise<{ code: number | null; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [workerBundlePath, dir, accountId], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stderr = '';
+      child.stderr.on('data', (chunk) => (stderr += chunk.toString()));
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, stderr }));
+    });
+  }
+
+  it('leaves no temp or lock files behind after save and remove', async () => {
+    await store.save(account('tmp-check'));
+    await store.remove('tmp-check');
+    const leftovers = fs.readdirSync(testDir).filter((f) => f.endsWith('.tmp') || f.endsWith('.lock'));
+    expect(leftovers).toEqual([]);
+  });
+
+  it('breaks a stale lock instead of wedging forever', async () => {
+    const lockPath = path.join(testDir, 'credentials.enc.lock');
+    fs.writeFileSync(lockPath, '');
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(lockPath, old, old);
+
+    await store.save(account('stale-lock'));
+
+    expect((await store.get('stale-lock'))?.email).toBe('stale-lock@example.com');
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('waits for a lock held by another process, then saves', async () => {
+    const lockPath = path.join(testDir, 'credentials.enc.lock');
+    fs.closeSync(fs.openSync(lockPath, 'wx'));
+    // save() blocks this thread while it waits, so the release has to come
+    // from a separate process rather than an in-process timer.
+    spawn(
+      process.execPath,
+      ['-e', `setTimeout(()=>{try{require('fs').rmSync(process.argv[1],{force:true})}catch{}},100)`, lockPath],
+      { stdio: 'ignore' },
+    );
+
+    await store.save(account('contended'));
+
+    expect((await store.get('contended'))?.email).toBe('contended@example.com');
+  });
+
+  it('keeps every update when separate OS processes save at once', async () => {
+    const ids = ['proc-a', 'proc-b', 'proc-c', 'proc-d', 'proc-e'];
+    const results = await Promise.all(ids.map((id) => spawnSaveWorker(testDir, id)));
+    for (const result of results) {
+      expect(result.code, `worker stderr: ${result.stderr}`).toBe(0);
+    }
+
+    const all = await new CredentialStore(testDir).list();
+    expect(all.map((a) => a.id).sort()).toEqual([...ids].sort());
+    const leftovers = fs.readdirSync(testDir).filter((f) => f.endsWith('.tmp') || f.endsWith('.lock'));
+    expect(leftovers).toEqual([]);
+  }, 30_000);
 });

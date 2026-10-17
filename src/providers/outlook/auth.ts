@@ -11,6 +11,7 @@ import {
   type TokenCacheContext,
 } from '@azure/msal-node';
 import { decryptWithMachineKey, encryptWithMachineKey } from '../../auth/credential-store.js';
+import { atomicWriteFileSync, acquireLockSync, releaseLockSync } from '../../auth/atomic-file.js';
 
 export interface OutlookAuthResult {
   accessToken: string;
@@ -54,12 +55,18 @@ function writeEncryptedCache(cacheFilePath: string, serialized: string): void {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   // Write to a sibling temp file and rename, so a crash mid-write can never
-  // leave a truncated cache behind (which would read as tampered).
-  const tmpPath = `${cacheFilePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpPath, encryptWithMachineKey(serialized), { mode: 0o600 });
-  fs.chmodSync(tmpPath, 0o600);
-  fs.renameSync(tmpPath, cacheFilePath);
+  // leave a truncated cache behind (which would read as tampered). The rename
+  // is retried on Windows' transient EPERM/EBUSY while another process reads.
+  atomicWriteFileSync(cacheFilePath, encryptWithMachineKey(serialized), 0o600);
 }
+
+/**
+ * Stale threshold for the cache lock. Longer than the credentials lock (10s)
+ * because one cache access cycle can include a network round trip to
+ * Microsoft (silent token refresh) between beforeCacheAccess and
+ * afterCacheAccess.
+ */
+const MSAL_LOCK_STALE_MS = 30_000;
 
 /**
  * Returns the serialized MSAL cache, or null when there is none yet.
@@ -118,10 +125,25 @@ export function createEncryptedFileCachePlugin(
   // beforeCacheAccess threw. If the cache could not be read, the in-memory
   // cache is empty, and writing it would silently replace the user's cache.
   let loadFailed = false;
+  // Several server processes and CLI tools share one cache file. The lock is
+  // taken in beforeCacheAccess and released in afterCacheAccess, so no other
+  // process reads or writes the file in between and a refresh token rotated
+  // by one process is never overwritten by another's stale copy. A lock left
+  // behind by a crash is broken once it is older than MSAL_LOCK_STALE_MS.
+  const lockPath = `${cacheFilePath}.lock`;
+  let lockHeld = false;
+  const release = () => {
+    if (lockHeld) {
+      lockHeld = false;
+      releaseLockSync(lockPath);
+    }
+  };
 
   return {
     async beforeCacheAccess(context: TokenCacheContext): Promise<void> {
       loadFailed = false;
+      acquireLockSync(lockPath, MSAL_LOCK_STALE_MS);
+      lockHeld = true;
       try {
         const serialized = loadSerializedCache(cacheFilePath, legacyPlaintextPath);
         if (serialized !== null) {
@@ -129,12 +151,17 @@ export function createEncryptedFileCachePlugin(
         }
       } catch (err) {
         loadFailed = true;
+        release();
         throw err;
       }
     },
     async afterCacheAccess(context: TokenCacheContext): Promise<void> {
-      if (loadFailed || !context.cacheHasChanged) return;
-      writeEncryptedCache(cacheFilePath, context.tokenCache.serialize());
+      try {
+        if (loadFailed || !context.cacheHasChanged) return;
+        writeEncryptedCache(cacheFilePath, context.tokenCache.serialize());
+      } finally {
+        release();
+      }
     },
   };
 }
