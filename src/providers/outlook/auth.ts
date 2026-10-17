@@ -11,6 +11,7 @@ import {
   type TokenCacheContext,
 } from '@azure/msal-node';
 import { decryptWithMachineKey, encryptWithMachineKey } from '../../auth/credential-store.js';
+import { atomicWriteFileSync, acquireLockSync, releaseLockSync } from '../../auth/atomic-file.js';
 
 export interface OutlookAuthResult {
   accessToken: string;
@@ -54,12 +55,18 @@ function writeEncryptedCache(cacheFilePath: string, serialized: string): void {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   // Write to a sibling temp file and rename, so a crash mid-write can never
-  // leave a truncated cache behind (which would read as tampered).
-  const tmpPath = `${cacheFilePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpPath, encryptWithMachineKey(serialized), { mode: 0o600 });
-  fs.chmodSync(tmpPath, 0o600);
-  fs.renameSync(tmpPath, cacheFilePath);
+  // leave a truncated cache behind (which would read as tampered). The rename
+  // is retried on Windows' transient EPERM/EBUSY while another process reads.
+  atomicWriteFileSync(cacheFilePath, encryptWithMachineKey(serialized), 0o600);
 }
+
+/**
+ * Stale threshold for the cache lock. Longer than the credentials lock (10s)
+ * because one cache access cycle can include a network round trip to
+ * Microsoft (silent token refresh) between beforeCacheAccess and
+ * afterCacheAccess.
+ */
+const MSAL_LOCK_STALE_MS = 30_000;
 
 /**
  * Returns the serialized MSAL cache, or null when there is none yet.
@@ -118,10 +125,25 @@ export function createEncryptedFileCachePlugin(
   // beforeCacheAccess threw. If the cache could not be read, the in-memory
   // cache is empty, and writing it would silently replace the user's cache.
   let loadFailed = false;
+  // Several server processes and CLI tools share one cache file. The lock is
+  // taken in beforeCacheAccess and released in afterCacheAccess, so no other
+  // process reads or writes the file in between and a refresh token rotated
+  // by one process is never overwritten by another's stale copy. A lock left
+  // behind by a crash is broken once it is older than MSAL_LOCK_STALE_MS.
+  const lockPath = `${cacheFilePath}.lock`;
+  let lockHeld = false;
+  const release = () => {
+    if (lockHeld) {
+      lockHeld = false;
+      releaseLockSync(lockPath);
+    }
+  };
 
   return {
     async beforeCacheAccess(context: TokenCacheContext): Promise<void> {
       loadFailed = false;
+      acquireLockSync(lockPath, MSAL_LOCK_STALE_MS);
+      lockHeld = true;
       try {
         const serialized = loadSerializedCache(cacheFilePath, legacyPlaintextPath);
         if (serialized !== null) {
@@ -129,22 +151,44 @@ export function createEncryptedFileCachePlugin(
         }
       } catch (err) {
         loadFailed = true;
+        release();
         throw err;
       }
     },
     async afterCacheAccess(context: TokenCacheContext): Promise<void> {
-      if (loadFailed || !context.cacheHasChanged) return;
-      writeEncryptedCache(cacheFilePath, context.tokenCache.serialize());
+      try {
+        if (loadFailed || !context.cacheHasChanged) return;
+        writeEncryptedCache(cacheFilePath, context.tokenCache.serialize());
+      } finally {
+        release();
+      }
     },
   };
 }
 
 export class OutlookAuth {
-  static readonly AUTHORITY = 'https://login.microsoftonline.com/consumers';
+  // 'common' signs in both personal Microsoft accounts and work or school
+  // (Microsoft 365) accounts; 'consumers' would refuse the latter.
+  static readonly AUTHORITY = 'https://login.microsoftonline.com/common';
   // MailboxSettings.ReadWrite is required for the messageRules API (block
   // rules) — confirmed by Microsoft's own docs to be supported for personal
   // Microsoft accounts (not just work/school), not just Mail.ReadWrite/Send.
   static readonly SCOPES = ['Mail.ReadWrite', 'Mail.Send', 'MailboxSettings.ReadWrite', 'offline_access'];
+  /**
+   * What silent refresh asks for: the mail scopes every account has
+   * consented to. Asking for SCOPES there made every call fail with
+   * AADSTS65001 (consent required) on work accounts signed in before
+   * MailboxSettings.ReadWrite was added, until they re-ran the wizard. The
+   * token still carries every scope the account has consented to, so the
+   * rule tools work once the wizard has been re-run.
+   */
+  static readonly MAIL_SCOPES = ['Mail.ReadWrite', 'Mail.Send', 'offline_access'];
+  /**
+   * Requested separately (incremental consent) so mail keeps working on
+   * tokens consented before calendar support existed. Granted once via
+   * `node dist/cli/grant-calendar.js`.
+   */
+  static readonly CALENDAR_SCOPES = ['Calendars.ReadWrite'];
 
   private pca: InstanceType<typeof PublicClientApplication>;
   private cryptoProvider: InstanceType<typeof CryptoProvider>;
@@ -162,17 +206,23 @@ export class OutlookAuth {
     this.cryptoProvider = new CryptoProvider();
   }
 
-  async getAuthUrl(redirectUri: string): Promise<{ url: string; codeVerifier: string; state: string }> {
+  async getAuthUrl(
+    redirectUri: string,
+    scopes: string[] = OutlookAuth.SCOPES,
+  ): Promise<{ url: string; codeVerifier: string; state: string }> {
     const { verifier, challenge } = await this.cryptoProvider.generatePkceCodes();
     // CSRF binding, verified by OAuthCallbackServer.waitForCode(state).
     const state = crypto.randomBytes(16).toString('base64url');
 
     const url = await this.pca.getAuthCodeUrl({
-      scopes: OutlookAuth.SCOPES,
+      scopes,
       redirectUri,
       codeChallenge: challenge,
       codeChallengeMethod: 'S256',
       state,
+      // Always show the account picker, so a second Microsoft account can be
+      // added while the browser is still signed in to the first one.
+      prompt: 'select_account',
     });
 
     return { url, codeVerifier: verifier, state };
@@ -181,12 +231,13 @@ export class OutlookAuth {
   async exchangeCode(
     code: string,
     codeVerifier: string,
-    redirectUri: string
+    redirectUri: string,
+    scopes: string[] = OutlookAuth.SCOPES,
   ): Promise<OutlookAuthResult> {
     const result: AuthenticationResult = await this.pca.acquireTokenByCode({
       code,
       codeVerifier,
-      scopes: OutlookAuth.SCOPES,
+      scopes,
       redirectUri,
     });
 
@@ -204,7 +255,10 @@ export class OutlookAuth {
    * This is the preferred refresh method — it uses the cached refresh token
    * automatically via acquireTokenSilent().
    */
-  async refreshTokenSilent(homeAccountId: string): Promise<OutlookAuthResult> {
+  async refreshTokenSilent(
+    homeAccountId: string,
+    scopes: string[] = OutlookAuth.MAIL_SCOPES,
+  ): Promise<OutlookAuthResult> {
     const account = await this.pca.getTokenCache().getAccountByHomeId(homeAccountId);
 
     if (!account) {
@@ -215,7 +269,7 @@ export class OutlookAuth {
 
     const result = await this.pca.acquireTokenSilent({
       account,
-      scopes: OutlookAuth.SCOPES,
+      scopes,
     });
 
     return {
@@ -254,7 +308,7 @@ export class OutlookAuth {
   async refreshToken(refreshToken: string): Promise<OutlookAuthResult> {
     const result = await this.pca.acquireTokenByRefreshToken({
       refreshToken,
-      scopes: OutlookAuth.SCOPES,
+      scopes: OutlookAuth.MAIL_SCOPES,
     });
 
     if (!result) {

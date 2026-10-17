@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ImapAdapter } from '../../src/providers/imap/adapter.js';
+import { mapParsedEmail } from '../../src/providers/imap/mapper.js';
 import { ProviderType } from '../../src/models/types.js';
 import type { SearchQuery } from '../../src/models/types.js';
 
@@ -375,7 +376,7 @@ describe('ImapAdapter send, move, delete, mark, createFolder', () => {
     expect(mockSendMail).toHaveBeenCalledWith(
       expect.objectContaining({
         from: 'test@example.com',
-        to: '"Bob" <bob@test.com>',
+        to: [{ name: 'Bob', address: 'bob@test.com' }],
         subject: 'Hello',
         text: 'Hi Bob',
         html: '<p>Hi Bob</p>',
@@ -393,9 +394,42 @@ describe('ImapAdapter send, move, delete, mark, createFolder', () => {
     });
     expect(mockSendMail).toHaveBeenCalledWith(
       expect.objectContaining({
-        cc: 'cc@test.com',
-        bcc: 'bcc@test.com',
+        cc: ['cc@test.com'],
+        bcc: ['bcc@test.com'],
       })
+    );
+  });
+
+  it('sendEmail derives a text part when only html is given', async () => {
+    await adapter.sendEmail({
+      to: [{ email: 'bob@test.com' }],
+      subject: 'HTML only',
+      body: { html: '<p>Hello <i>Bob</i></p>' },
+    });
+    expect(mockSendMail).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello Bob', html: '<p>Hello <i>Bob</i></p>' }),
+    );
+  });
+
+  it('sendEmail sends text only when only text is given', async () => {
+    await adapter.sendEmail({ to: [{ email: 'bob@test.com' }], subject: 'Plain', body: { text: 'Just text' } });
+    const mail = mockSendMail.mock.calls.at(-1)![0];
+    expect(mail.text).toBe('Just text');
+    expect(mail.html).toBeUndefined();
+  });
+
+  it('sendEmail passes display names as address objects so commas and quotes stay intact', async () => {
+    await adapter.sendEmail({
+      to: [{ name: 'Müller, Hans', email: 'hans@test.com' }],
+      cc: [{ name: 'Anna "Ann" Schmidt', email: 'anna@test.com' }],
+      subject: 'Names',
+      body: { text: 'x' },
+    });
+    expect(mockSendMail).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: [{ name: 'Müller, Hans', address: 'hans@test.com' }],
+        cc: [{ name: 'Anna "Ann" Schmidt', address: 'anna@test.com' }],
+      }),
     );
   });
 
@@ -519,6 +553,29 @@ describe('ImapAdapter threads, drafts, attachments', () => {
     expect(thread.lastMessageDate).toBeTruthy();
   });
 
+  it('getThread looks in INBOX when no sourceFolder is given', async () => {
+    const thread = await adapter.getThread('<msg-1@example.com>');
+    const client = (adapter as any).client;
+    expect(client.getMailboxLock).toHaveBeenCalledWith('INBOX');
+    expect(thread.messages.every((m) => m.folder === 'INBOX')).toBe(true);
+  });
+
+  it('getThread looks in the resolved sourceFolder and reports it on the messages', async () => {
+    const thread = await adapter.getThread('<msg-1@example.com>', 'sent');
+    const client = (adapter as any).client;
+    expect(client.getMailboxLock).toHaveBeenCalledWith('Sent');
+    expect(client.getMailboxLock).not.toHaveBeenCalledWith('INBOX');
+    expect(thread.messages.length).toBeGreaterThan(0);
+    expect(thread.messages.every((m) => m.folder === 'Sent')).toBe(true);
+    expect(mockMailboxLockRelease).toHaveBeenCalled();
+  });
+
+  it('getThread names the folder when the thread is not in it', async () => {
+    mockSearchResult = [];
+    await expect(adapter.getThread('<nope@example.com>', 'Sent')).rejects.toThrow('Thread <nope@example.com> not found in "Sent"');
+    expect(mockMailboxLockRelease).toHaveBeenCalled();
+  });
+
   it('getThread calls search with header criteria', async () => {
     await adapter.getThread('<msg-1@example.com>');
     const client = (adapter as any).client;
@@ -535,7 +592,7 @@ describe('ImapAdapter threads, drafts, attachments', () => {
     const client = (adapter as any).client;
     expect(client.append).toHaveBeenCalledWith(
       'Drafts',
-      expect.any(String),
+      expect.any(Buffer),
       expect.arrayContaining(['\\Draft', '\\Seen']),
     );
   });
@@ -552,9 +609,71 @@ describe('ImapAdapter threads, drafts, attachments', () => {
     expect(client.messageDelete).toHaveBeenCalledWith('99', { uid: true });
     expect(client.append).toHaveBeenCalledWith(
       'Drafts',
-      expect.stringContaining('Updated subject'),
+      expect.any(Buffer),
       expect.arrayContaining(['\\Draft', '\\Seen']),
     );
+    expect(client.append.mock.calls[0][1].toString()).toContain('Subject: Updated subject');
+  });
+
+  it('createDraft stores both the text and the html part, Bcc and encoded headers', async () => {
+    const { simpleParser: parse } = await vi.importActual<typeof import('mailparser')>('mailparser');
+    await adapter.createDraft({
+      to: [{ name: 'Müller, Hans', email: 'hans@test.com' }],
+      bcc: [{ email: 'hidden@test.com' }],
+      subject: 'Entwurf für Jürgen ✉️',
+      body: { text: 'Plain part', html: '<p>HTML <b>part</b></p>' },
+    });
+    const client = (adapter as any).client;
+    const parsed = await parse(client.append.mock.calls[0][1]);
+    expect(parsed.text?.trim()).toBe('Plain part');
+    expect(parsed.html).toContain('<p>HTML <b>part</b></p>');
+    expect(parsed.subject).toBe('Entwurf für Jürgen ✉️');
+    const to = Array.isArray(parsed.to) ? parsed.to[0] : parsed.to;
+    expect(to?.value).toEqual([{ name: 'Müller, Hans', address: 'hans@test.com' }]);
+    const bcc = Array.isArray(parsed.bcc) ? parsed.bcc[0] : parsed.bcc;
+    expect(bcc?.value[0].address).toBe('hidden@test.com');
+  });
+
+  it('createDraft with html only stores the html and a derived text part (it used to be empty)', async () => {
+    const { simpleParser: parse } = await vi.importActual<typeof import('mailparser')>('mailparser');
+    await adapter.createDraft({
+      to: [{ email: 'bob@test.com' }],
+      subject: 'HTML only',
+      body: { html: '<p>Hello <i>Bob</i></p>' },
+    });
+    const client = (adapter as any).client;
+    const parsed = await parse(client.append.mock.calls[0][1]);
+    expect(parsed.html).toContain('<p>Hello <i>Bob</i></p>');
+    expect(parsed.text?.trim()).toBe('Hello Bob');
+  });
+
+  it('updateDraft keeps the old revision when building the new message fails', async () => {
+    vi.spyOn(adapter as any, 'buildDraftMessage').mockRejectedValueOnce(new Error('MIME build failed'));
+    await expect(adapter.updateDraft('99', {
+      to: [{ email: 'bob@test.com' }],
+      subject: 'Rev 2',
+      body: { text: 'Plain v2' },
+    })).rejects.toThrow('MIME build failed');
+    const client = (adapter as any).client;
+    expect(client.messageDelete).not.toHaveBeenCalled();
+    expect(client.append).not.toHaveBeenCalled();
+  });
+
+  it('updateDraft stores both parts in the new revision', async () => {
+    const { simpleParser: parse } = await vi.importActual<typeof import('mailparser')>('mailparser');
+    await adapter.updateDraft('99', {
+      to: [{ email: 'bob@test.com' }],
+      subject: 'Rev 2',
+      body: { text: 'Plain v2', html: '<p>HTML v2</p>' },
+      inReplyTo: '<orig@test.com>',
+      references: ['<orig@test.com>'],
+    });
+    const client = (adapter as any).client;
+    const parsed = await parse(client.append.mock.calls[0][1]);
+    expect(parsed.text?.trim()).toBe('Plain v2');
+    expect(parsed.html).toContain('<p>HTML v2</p>');
+    expect(parsed.inReplyTo).toBe('<orig@test.com>');
+    expect(parsed.references).toBe('<orig@test.com>');
   });
 
   it('listDrafts returns emails from Drafts folder', async () => {
@@ -601,7 +720,7 @@ describe('ImapAdapter threads, drafts, attachments', () => {
 
     expect(client.append).toHaveBeenCalledWith(
       '[Gmail]/Drafts',
-      expect.any(String),
+      expect.any(Buffer),
       expect.arrayContaining(['\\Draft', '\\Seen']),
     );
   });
@@ -621,7 +740,7 @@ describe('ImapAdapter threads, drafts, attachments', () => {
 
     expect(client.append).toHaveBeenCalledWith(
       '[Gmail]/Entwürfe',
-      expect.any(String),
+      expect.any(Buffer),
       expect.arrayContaining(['\\Draft', '\\Seen']),
     );
   });
@@ -675,5 +794,276 @@ describe('ImapAdapter threads, drafts, attachments', () => {
       createMockMessage(42, { text: 'uid-42 body' }),
     ];
     await expect(adapter.getAttachment('42', 'nonexistent')).rejects.toThrow();
+  });
+
+  describe('getAttachment ids and folders', () => {
+    // Three attachments: only the middle one has a Content-ID, so the mapper
+    // lists them as att-0, <logo@x>, att-2.
+    const parsedWithAttachments = () => ({
+      ...createParsedEmail(42),
+      attachments: [
+        { filename: 'a.pdf', contentType: 'application/pdf', size: 1, content: Buffer.from('A') },
+        { contentId: '<logo@x>', filename: 'logo.png', contentType: 'image/png', size: 1, content: Buffer.from('L') },
+        { contentType: 'application/zip', size: 1, content: Buffer.from('Z') },
+      ],
+    });
+
+    // Queues the parse result for the one message the next call reads. Only
+    // called by tests that get as far as parsing, so nothing is left queued.
+    async function parsesTo(parsed: unknown) {
+      const { simpleParser: mockParser } = await import('mailparser');
+      (mockParser as any).mockResolvedValueOnce(parsed);
+    }
+
+    beforeEach(() => {
+      mockFetchMessages = [createMockMessage(42, { text: 'uid-42 body' })];
+    });
+
+    it('every id the mapper hands out resolves to the same attachment', async () => {
+      const listed = mapParsedEmail(parsedWithAttachments(), 'INBOX', 'test-1', 42).attachments;
+      expect(listed.map((a) => a.id)).toEqual(['att-0', '<logo@x>', 'att-2']);
+
+      const contents: string[] = [];
+      for (const att of listed) {
+        await parsesTo(parsedWithAttachments());
+        const { data, meta } = await adapter.getAttachment('42', att.id);
+        expect(meta.id).toBe(att.id);
+        contents.push(data.toString());
+      }
+      expect(contents).toEqual(['A', 'L', 'Z']);
+    });
+
+    it('resolves att-N by position for an attachment without a Content-ID or file name', async () => {
+      await parsesTo(parsedWithAttachments());
+      const { data, meta } = await adapter.getAttachment('42', 'att-2');
+      expect(data.toString()).toBe('Z');
+      expect(meta).toEqual({ id: 'att-2', filename: 'attachment', contentType: 'application/zip', size: 1 });
+    });
+
+    it('still resolves by file name', async () => {
+      await parsesTo(parsedWithAttachments());
+      const { data, meta } = await adapter.getAttachment('42', 'logo.png');
+      expect(data.toString()).toBe('L');
+      expect(meta.id).toBe('<logo@x>');
+    });
+
+    it('does not resolve att-N to an attachment that is listed under its Content-ID', async () => {
+      await parsesTo(parsedWithAttachments());
+      await expect(adapter.getAttachment('42', 'att-1')).rejects.toThrow('Attachment att-1 not found in email 42');
+    });
+
+    it('rejects a position past the last attachment', async () => {
+      await parsesTo(parsedWithAttachments());
+      await expect(adapter.getAttachment('42', 'att-3')).rejects.toThrow('Attachment att-3 not found in email 42');
+    });
+
+    it('opens INBOX when no sourceFolder is given', async () => {
+      await parsesTo(parsedWithAttachments());
+      await adapter.getAttachment('42', 'att-0');
+      expect((adapter as any).client.getMailboxLock).toHaveBeenCalledWith('INBOX');
+    });
+
+    it('opens the resolved sourceFolder for a message outside INBOX', async () => {
+      await parsesTo(parsedWithAttachments());
+      await adapter.getAttachment('42', 'att-0', 'sent');
+      const client = (adapter as any).client;
+      expect(client.getMailboxLock).toHaveBeenCalledWith('Sent');
+      expect(client.getMailboxLock).not.toHaveBeenCalledWith('INBOX');
+      expect(mockMailboxLockRelease).toHaveBeenCalled();
+    });
+
+    it('names the folder when the message is not in it', async () => {
+      mockFetchMessages = [];
+      await expect(adapter.getAttachment('42', 'att-0', 'Sent')).rejects.toThrow('Email 42 not found in "Sent"');
+      expect(mockMailboxLockRelease).toHaveBeenCalled();
+    });
+
+    it('getEmail opens the resolved sourceFolder as well', async () => {
+      await parsesTo(parsedWithAttachments());
+      const email = await adapter.getEmail('42', 'sent');
+      expect((adapter as any).client.getMailboxLock).toHaveBeenCalledWith('Sent');
+      expect(email.folder).toBe('Sent');
+      expect(email.attachments.map((a) => a.id)).toEqual(['att-0', '<logo@x>', 'att-2']);
+    });
+  });
+
+  describe('updateDraft keeps a reply draft in its thread', () => {
+    const update = { to: [{ email: 'bob@test.com' }], subject: 'Re: Thread', body: { text: 'Second version' } };
+
+    async function storedDraft(threading: Record<string, unknown>) {
+      mockFetchMessages = [createMockMessage(99, { text: 'uid-99 body' })];
+      const { simpleParser: mockParser } = await import('mailparser');
+      (mockParser as any).mockResolvedValueOnce({ ...createParsedEmail(99), ...threading });
+    }
+
+    async function appended() {
+      const { simpleParser: parse } = await vi.importActual<typeof import('mailparser')>('mailparser');
+      return parse((adapter as any).client.append.mock.calls[0][1]);
+    }
+
+    it('carries In-Reply-To and References of the old revision into the new one', async () => {
+      await storedDraft({ inReplyTo: '<orig@test.com>', references: ['<root@test.com>', '<orig@test.com>'] });
+
+      await adapter.updateDraft('99', update);
+
+      const client = (adapter as any).client;
+      expect(client.fetchOne).toHaveBeenCalledWith('99', { source: true, uid: true }, { uid: true });
+      const parsed = await appended();
+      expect(parsed.inReplyTo).toBe('<orig@test.com>');
+      expect(parsed.references).toEqual(['<root@test.com>', '<orig@test.com>']);
+      expect(parsed.text?.trim()).toBe('Second version');
+      // The old revision is read before it is deleted.
+      expect(client.fetchOne.mock.invocationCallOrder[0]).toBeLessThan(client.messageDelete.mock.invocationCallOrder[0]);
+    });
+
+    it('carries a single References value (mailparser gives a string then)', async () => {
+      await storedDraft({ inReplyTo: '<orig@test.com>', references: '<orig@test.com>' });
+      await adapter.updateDraft('99', update);
+      const parsed = await appended();
+      expect(parsed.inReplyTo).toBe('<orig@test.com>');
+      expect(parsed.references).toBe('<orig@test.com>');
+    });
+
+    it('carries In-Reply-To alone when the old revision has no References', async () => {
+      await storedDraft({ inReplyTo: '<orig@test.com>' });
+      await adapter.updateDraft('99', update);
+      const parsed = await appended();
+      expect(parsed.inReplyTo).toBe('<orig@test.com>');
+      expect(parsed.references).toBeUndefined();
+    });
+
+    it('a draft that is not a reply stays without reply headers', async () => {
+      await storedDraft({});
+      await adapter.updateDraft('99', update);
+      const parsed = await appended();
+      expect(parsed.inReplyTo).toBeUndefined();
+      expect(parsed.references).toBeUndefined();
+    });
+
+    it('the caller\'s inReplyTo wins over the old revision\'s', async () => {
+      await storedDraft({ inReplyTo: '<orig@test.com>', references: ['<orig@test.com>'] });
+      await adapter.updateDraft('99', { ...update, inReplyTo: '<other@test.com>', references: ['<other@test.com>'] });
+      const parsed = await appended();
+      expect(parsed.inReplyTo).toBe('<other@test.com>');
+      expect(parsed.references).toBe('<other@test.com>');
+    });
+
+    it('the old revision is not read when the caller names both the reply headers and the files', async () => {
+      await adapter.updateDraft('99', { ...update, inReplyTo: '<other@test.com>', references: ['<other@test.com>'], attachments: [] });
+      expect((adapter as any).client.fetchOne).not.toHaveBeenCalled();
+      expect((await appended()).inReplyTo).toBe('<other@test.com>');
+    });
+
+    it('still writes the new revision when the old one is gone', async () => {
+      mockFetchMessages = [];
+      const result = await adapter.updateDraft('99', update);
+      expect(result.id).toBe('100');
+      expect((await appended()).inReplyTo).toBeUndefined();
+    });
+
+    it('leaves the old revision alone when it cannot be read', async () => {
+      const client = (adapter as any).client;
+      client.fetchOne.mockRejectedValueOnce(new Error('connection lost'));
+      await expect(adapter.updateDraft('99', update)).rejects.toThrow('connection lost');
+      expect(client.messageDelete).not.toHaveBeenCalled();
+      expect(client.append).not.toHaveBeenCalled();
+      expect(mockMailboxLockRelease).toHaveBeenCalled();
+    });
+
+    it('reads the old revision from the given sourceFolder', async () => {
+      await storedDraft({ inReplyTo: '<orig@test.com>' });
+      await adapter.updateDraft('99', update, 'Sent');
+      const client = (adapter as any).client;
+      expect(client.getMailboxLock).toHaveBeenCalledWith('Sent');
+      expect(client.append.mock.calls[0][0]).toBe('Sent');
+      expect((await appended()).inReplyTo).toBe('<orig@test.com>');
+    });
+
+    describe('and keeps its files', () => {
+      const files = [
+        { filename: 'Invoice 59.pdf', contentType: 'application/pdf', content: Buffer.from('%PDF-1.4 invoice'), related: false },
+        { filename: 'logo.png', contentType: 'image/png', content: Buffer.from('png'), related: true, cid: 'logo@x' },
+        { contentType: 'text/plain', content: Buffer.from('no name') },
+      ];
+      // The old body embeds logo.png and does not reference the file below.
+      const oldHtml = '<p>Hi <img src="cid:logo@x"></p>';
+      const unreferenced = {
+        filename: 'scan.png', contentType: 'image/png', content: Buffer.from('scan'), related: true, cid: 'scan@x',
+      };
+      const attachmentsOf = async () =>
+        (await appended()).attachments.map((a) => ({ filename: a.filename, type: a.contentType, text: a.content.toString() }));
+
+      it('carries the old revision\'s files over when the update names none, without images embedded in the old body', async () => {
+        await storedDraft({ attachments: files, html: oldHtml });
+
+        await adapter.updateDraft('99', update);
+
+        expect(await attachmentsOf()).toEqual([
+          { filename: 'Invoice 59.pdf', type: 'application/pdf', text: '%PDF-1.4 invoice' },
+          { filename: 'attachment-2', type: 'text/plain', text: 'no name' },
+        ]);
+      });
+
+      it('keeps a related part the old HTML does not reference', async () => {
+        await storedDraft({ attachments: [...files, unreferenced], html: oldHtml });
+
+        await adapter.updateDraft('99', update);
+
+        expect((await appended()).attachments.map((a) => a.filename)).toEqual(['Invoice 59.pdf', 'attachment-2', 'scan.png']);
+      });
+
+      it('keeps the files and the reply headers together', async () => {
+        await storedDraft({ inReplyTo: '<orig@test.com>', references: ['<orig@test.com>'], attachments: files, html: oldHtml });
+
+        await adapter.updateDraft('99', update);
+
+        const parsed = await appended();
+        expect(parsed.inReplyTo).toBe('<orig@test.com>');
+        expect(parsed.attachments.map((a) => a.filename)).toEqual(['Invoice 59.pdf', 'attachment-2']);
+      });
+
+      it('replaces the old files when the update names its own', async () => {
+        await storedDraft({ attachments: files, html: oldHtml });
+
+        await adapter.updateDraft('99', {
+          ...update,
+          attachments: [{ filename: 'new.txt', content: Buffer.from('new'), contentType: 'text/plain' }],
+        });
+
+        expect(await attachmentsOf()).toEqual([{ filename: 'new.txt', type: 'text/plain', text: 'new' }]);
+      });
+
+      it('removes the old files when the update gives an empty list', async () => {
+        await storedDraft({ attachments: files, html: oldHtml });
+
+        await adapter.updateDraft('99', { ...update, attachments: [] });
+
+        expect(await attachmentsOf()).toEqual([]);
+      });
+
+      it('leaves a draft without files as it is', async () => {
+        await storedDraft({ attachments: [] });
+
+        await adapter.updateDraft('99', update);
+
+        expect(await attachmentsOf()).toEqual([]);
+      });
+    });
+  });
+});
+
+describe('mapParsedEmail headers', () => {
+  it('maps header lines to their values, without the header name and unfolded', async () => {
+    const { simpleParser: parse } = await vi.importActual<typeof import('mailparser')>('mailparser');
+    const parsed = await parse(Buffer.from(
+      'Message-ID: <abc@x>\r\nReferences: <r1@x>\r\n <r2@x>\r\nIn-Reply-To: <r2@x>\r\nSubject: Time: 10:30\r\n\r\nbody',
+    ));
+    const email = mapParsedEmail(parsed, 'INBOX', 'test-1', 7);
+    expect(email.headers).toMatchObject({
+      'message-id': '<abc@x>',
+      references: '<r1@x> <r2@x>',
+      'in-reply-to': '<r2@x>',
+      subject: 'Time: 10:30',
+    });
   });
 });

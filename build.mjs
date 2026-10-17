@@ -17,6 +17,7 @@ const shared = {
     'imapflow',
     'mailparser',
     'nodemailer',
+    'html-to-text',
   ],
 };
 
@@ -33,6 +34,21 @@ if (process.argv.includes('--watch')) {
     ...shared,
     entryPoints: ['src/setup/wizard.ts'],
     banner: { js: '#!/usr/bin/env node\n' },
+  });
+
+  // Headless CLIs for scripts and schedulers (no MCP server). esbuild builds
+  // only the entry points listed here: a new src/cli file that is not added
+  // compiles to nothing, silently.
+  await build({
+    ...shared,
+    entryPoints: [
+      'src/cli/watcher-fetch.ts',
+      'src/cli/inbound-scan.ts',
+      'src/cli/jev-fetch.ts',
+      'src/cli/jev-send.ts',
+      // One-time Calendars.ReadWrite consent for email_calendar_event_create.
+      'src/cli/grant-calendar.ts',
+    ],
   });
 
   // Build CLI entry with shebang

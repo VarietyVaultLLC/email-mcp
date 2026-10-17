@@ -206,6 +206,25 @@ describe('OutlookAdapter', () => {
       const searchCall = (mockMessagesRequest.search as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
       expect(searchCall).toContain('subject:test subject');
       expect(searchCall).toContain('body:important content');
+      // Graph rejects $orderby together with $search.
+      expect(mockMessagesRequest.orderby).not.toHaveBeenCalled();
+    });
+
+    it('orders by received date when there is no $search', async () => {
+      const mockMessagesRequest = createMockGraphRequest({ value: [] });
+      mockApiRequests.set('/me/messages', mockMessagesRequest);
+      await adapter.connect({
+        id: 'outlook-1',
+        name: 'Test',
+        provider: 'outlook',
+        email: 'test@outlook.com',
+        oauth: { access_token: 'token', refresh_token: 'rt', expiry: '' },
+      });
+
+      await adapter.search({ since: '2026-01-01' });
+
+      expect(mockMessagesRequest.search).not.toHaveBeenCalled();
+      expect(mockMessagesRequest.orderby).toHaveBeenCalledWith('receivedDateTime desc');
     });
 
     it('maps Graph messages to Email type', async () => {
@@ -229,6 +248,8 @@ describe('OutlookAdapter', () => {
             isDraft: false,
             importance: 'normal',
             categories: ['Blue category'],
+            inferenceClassification: 'other',
+            webLink: 'https://outlook.office365.com/owa/?ItemID=msg-1',
           },
         ],
       });
@@ -254,6 +275,9 @@ describe('OutlookAdapter', () => {
       expect(results[0].flags.read).toBe(true);
       expect(results[0].flags.draft).toBe(false);
       expect(results[0].categories).toEqual(['Blue category']);
+      expect(results[0].hasAttachments).toBe(false);
+      expect(results[0].inferenceClassification).toBe('other');
+      expect(results[0].webLink).toBe('https://outlook.office365.com/owa/?ItemID=msg-1');
     });
   });
 
@@ -450,15 +474,165 @@ describe('OutlookAdapter', () => {
       });
 
       expect(createReply.post).toHaveBeenCalled();
-      expect(patchReq.patch).toHaveBeenCalledWith(
-        expect.objectContaining({
-          body: { contentType: 'text', content: 'Thanks' },
-          toRecipients: [{ emailAddress: { name: undefined, address: 'client@test.com' } }],
-        }),
-      );
+      // Exactly these fields: the caller's subject once (Graph pre-fills its
+      // own "RE: ..."), and no cc/bcc keys, so Graph's defaults stay.
+      expect(patchReq.patch).toHaveBeenCalledWith({
+        subject: 'Re: x',
+        body: { contentType: 'text', content: 'Thanks' },
+        toRecipients: [{ emailAddress: { name: undefined, address: 'client@test.com' } }],
+      });
       expect(sendReq.post).toHaveBeenCalled();
       expect(sendMail.post).not.toHaveBeenCalled();
+      expect(patchReq.delete).not.toHaveBeenCalled();
       expect(result.id).toBe('reply-draft-1');
+    });
+
+    describe('reply through createReply', () => {
+      const account = {
+        id: 'outlook-1',
+        name: 'Test',
+        provider: 'outlook' as const,
+        email: 'test@outlook.com',
+        oauth: { access_token: 'token', refresh_token: 'rt', expiry: '' },
+      };
+      const reply = { to: [{ email: 'client@test.com' }], subject: 'Re: x', body: { text: 'Thanks' }, replyToGraphId: 'orig-1' };
+      const file = { filename: 'a.pdf', content: Buffer.from('pdf'), contentType: 'application/pdf' };
+
+      function setUp() {
+        const createReply = createMockGraphRequest({ id: 'reply-draft-1' });
+        mockApiRequests.set('/me/messages/orig-1/createReply', createReply);
+        // PATCH and DELETE of the draft go to the same path.
+        const draftReq = createMockGraphRequest({});
+        mockApiRequests.set('/me/messages/reply-draft-1', draftReq);
+        const attachReq = createMockGraphRequest({});
+        mockApiRequests.set('/me/messages/reply-draft-1/attachments', attachReq);
+        const sendReq = createMockGraphRequest({});
+        mockApiRequests.set('/me/messages/reply-draft-1/send', sendReq);
+        return { createReply, draftReq, attachReq, sendReq };
+      }
+
+      beforeEach(async () => {
+        await adapter.connect(account);
+      });
+
+      it('an explicit empty cc and bcc clear what Graph pre-filled', async () => {
+        const { draftReq } = setUp();
+        await adapter.sendEmail({ ...reply, cc: [], bcc: [] });
+        expect(draftReq.patch).toHaveBeenCalledWith(expect.objectContaining({ ccRecipients: [], bccRecipients: [] }));
+      });
+
+      it('given cc and bcc replace what Graph pre-filled', async () => {
+        const { draftReq } = setUp();
+        await adapter.sendEmail({ ...reply, cc: [{ email: 'carol@test.com' }], bcc: [{ name: 'Dave', email: 'dave@test.com' }] });
+        expect(draftReq.patch).toHaveBeenCalledWith(expect.objectContaining({
+          ccRecipients: [{ emailAddress: { name: undefined, address: 'carol@test.com' } }],
+          bccRecipients: [{ emailAddress: { name: 'Dave', address: 'dave@test.com' } }],
+        }));
+      });
+
+      it('an empty to keeps the recipient Graph pre-filled', async () => {
+        const { draftReq, sendReq } = setUp();
+        await adapter.sendEmail({ ...reply, to: [] });
+        expect((draftReq.patch as any).mock.calls[0][0]).not.toHaveProperty('toRecipients');
+        expect(sendReq.post).toHaveBeenCalled();
+      });
+
+      it('uploads each attachment to the draft before sending', async () => {
+        const { attachReq, sendReq } = setUp();
+        await adapter.sendEmail({ ...reply, attachments: [file, { ...file, filename: 'b.pdf' }] });
+        expect((attachReq.post as any).mock.calls.map((c: any[]) => c[0].name)).toEqual(['a.pdf', 'b.pdf']);
+        expect((attachReq.post as any).mock.invocationCallOrder[1]).toBeLessThan((sendReq.post as any).mock.invocationCallOrder[0]);
+      });
+
+      it('accepts files that are each under 3 MB even when they total more', async () => {
+        const { attachReq, sendReq } = setUp();
+        const twoMb = { ...file, content: Buffer.alloc(2 * 1024 * 1024) };
+        await adapter.sendEmail({ ...reply, attachments: [twoMb, { ...twoMb, filename: 'b.pdf' }] });
+        expect(attachReq.post).toHaveBeenCalledTimes(2);
+        expect(sendReq.post).toHaveBeenCalled();
+      });
+
+      it('refuses a file over 3 MB before any reply draft is created, on send and on draft create', async () => {
+        const { createReply } = setUp();
+        const big = { ...reply, attachments: [{ ...file, filename: 'big.zip', content: Buffer.alloc(3 * 1024 * 1024 + 1) }] };
+        await expect(adapter.sendEmail(big)).rejects.toThrow(/Outlook accepts attachments up to 3\.0 MB.*big\.zip/);
+        await expect(adapter.createDraft(big)).rejects.toThrow(/Outlook accepts attachments up to 3\.0 MB.*big\.zip/);
+        expect(createReply.post).not.toHaveBeenCalled();
+      });
+
+      it('creates nothing to clean up when createReply itself fails', async () => {
+        const { createReply, draftReq } = setUp();
+        createReply.post = vi.fn().mockRejectedValue(new Error('original not found'));
+        await expect(adapter.sendEmail(reply)).rejects.toThrow('original not found');
+        expect(draftReq.delete).not.toHaveBeenCalled();
+      });
+
+      it('deletes the draft and rethrows when the PATCH fails', async () => {
+        const { draftReq, sendReq } = setUp();
+        const failure = new Error('patch failed');
+        draftReq.patch = vi.fn().mockRejectedValue(failure);
+        await expect(adapter.sendEmail(reply)).rejects.toBe(failure);
+        expect(draftReq.delete).toHaveBeenCalledTimes(1);
+        expect(sendReq.post).not.toHaveBeenCalled();
+      });
+
+      it('deletes the draft and rethrows when an attachment upload fails', async () => {
+        const { draftReq, attachReq, sendReq } = setUp();
+        const failure = new Error('upload failed');
+        attachReq.post = vi.fn().mockRejectedValue(failure);
+        await expect(adapter.sendEmail({ ...reply, attachments: [file] })).rejects.toBe(failure);
+        expect(draftReq.delete).toHaveBeenCalledTimes(1);
+        expect(sendReq.post).not.toHaveBeenCalled();
+      });
+
+      it('keeps the draft when the send fails, and says where it is: the mail may be on its way', async () => {
+        const { draftReq, sendReq } = setUp();
+        const failure = new Error('gateway timeout');
+        sendReq.post = vi.fn().mockRejectedValue(failure);
+        const error: any = await adapter.sendEmail(reply).catch((e) => e);
+        expect(error).toBeInstanceOf(Error);
+        expect(error.message).toBe(
+          'gateway timeout (the reply was saved as draft reply-draft-1 in Drafts and was not confirmed as sent; check Sent Items before sending it again)',
+        );
+        expect(error.cause).toBe(failure);
+        expect(draftReq.patch).toHaveBeenCalledTimes(1);
+        expect(draftReq.delete).not.toHaveBeenCalled();
+      });
+
+      it('keeps the draft with its attachments when the send fails after the uploads', async () => {
+        const { draftReq, attachReq, sendReq } = setUp();
+        sendReq.post = vi.fn().mockRejectedValue(new Error('503'));
+        await expect(adapter.sendEmail({ ...reply, attachments: [file] })).rejects.toThrow(/saved as draft reply-draft-1 in Drafts/);
+        expect(attachReq.post).toHaveBeenCalledTimes(1);
+        expect(draftReq.delete).not.toHaveBeenCalled();
+      });
+
+      it('says that the draft was left in Drafts when a fill fails and deleting it fails too', async () => {
+        const { draftReq } = setUp();
+        const failure = new Error('patch failed');
+        draftReq.patch = vi.fn().mockRejectedValue(failure);
+        draftReq.delete = vi.fn().mockRejectedValue(new Error('delete failed'));
+        const error: any = await adapter.sendEmail(reply).catch((e) => e);
+        expect(error.message).toMatch(/^patch failed \(the reply draft reply-draft-1 could not be removed and was left in Drafts: delete failed\)$/);
+        expect(error.cause).toBe(failure);
+      });
+
+      it('createDraft deletes the half-built reply draft when filling it fails', async () => {
+        const { draftReq, attachReq, sendReq } = setUp();
+        const failure = new Error('upload failed');
+        attachReq.post = vi.fn().mockRejectedValue(failure);
+        await expect(adapter.createDraft({ ...reply, attachments: [file] })).rejects.toBe(failure);
+        expect(draftReq.delete).toHaveBeenCalledTimes(1);
+        expect(sendReq.post).not.toHaveBeenCalled();
+      });
+
+      it('createDraft keeps the finished reply draft', async () => {
+        const { draftReq, sendReq } = setUp();
+        expect(await adapter.createDraft(reply)).toEqual({ id: 'reply-draft-1' });
+        expect(draftReq.patch).toHaveBeenCalledWith(expect.objectContaining({ subject: 'Re: x' }));
+        expect(draftReq.delete).not.toHaveBeenCalled();
+        expect(sendReq.post).not.toHaveBeenCalled();
+      });
     });
 
     it('calls POST /me/sendMail with correct payload', async () => {
@@ -516,6 +690,34 @@ describe('OutlookAdapter', () => {
         expect.objectContaining({
           message: expect.objectContaining({
             body: { contentType: 'text', content: 'Plain text content' },
+          }),
+        })
+      );
+    });
+
+    it('sends the html part when both text and html are given (Graph holds one body)', async () => {
+      const mockSendRequest = createMockGraphRequest();
+      mockApiRequests.set('/me/sendMail', mockSendRequest);
+
+      await adapter.connect({
+        id: 'outlook-1',
+        name: 'Test',
+        provider: 'outlook',
+        email: 'test@outlook.com',
+        oauth: { access_token: 'token', refresh_token: 'rt', expiry: '' },
+      });
+
+      await adapter.sendEmail({
+        to: [{ name: 'Müller, Hans', email: 'hans@test.com' }],
+        subject: 'Both',
+        body: { text: 'Plain part', html: '<p>HTML part</p>' },
+      });
+
+      expect(mockSendRequest.post).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.objectContaining({
+            body: { contentType: 'html', content: '<p>HTML part</p>' },
+            toRecipients: [{ emailAddress: { name: 'Müller, Hans', address: 'hans@test.com' } }],
           }),
         })
       );
@@ -606,6 +808,35 @@ describe('OutlookAdapter', () => {
         }),
       );
     });
+
+    it('refuses a message whose base64-encoded request body passes 4 MB, on a draft and on send', async () => {
+      const draftRequest = createMockGraphRequest({ id: 'draft-att' });
+      mockApiRequests.set('/me/messages', draftRequest);
+      const sendRequest = createMockGraphRequest({});
+      mockApiRequests.set('/me/sendMail', sendRequest);
+      await adapter.connect({
+        id: 'outlook-1',
+        name: 'Test',
+        provider: 'outlook',
+        email: 'test@outlook.com',
+        oauth: { access_token: 'token', refresh_token: 'rt', expiry: '' },
+      });
+      const twoMb = Buffer.alloc(2 * 1024 * 1024); // 2 x 2 MB is about 5.3 MB once base64-encoded
+      const message = {
+        to: [{ email: 'bob@test.com' }],
+        subject: 'Two files',
+        body: { text: 'Attached' },
+        attachments: [
+          { filename: 'a.bin', content: twoMb, contentType: 'application/octet-stream' },
+          { filename: 'b.bin', content: twoMb, contentType: 'application/octet-stream' },
+        ],
+      };
+
+      await expect(adapter.createDraft(message)).rejects.toThrow(/requests up to 4\.0 MB.*base64-encoded/);
+      await expect(adapter.sendEmail(message)).rejects.toThrow(/requests up to 4\.0 MB/);
+      expect(draftRequest.post).not.toHaveBeenCalled();
+      expect(sendRequest.post).not.toHaveBeenCalled();
+    });
   });
 
   describe('updateDraft', () => {
@@ -636,6 +867,38 @@ describe('OutlookAdapter', () => {
       );
     });
 
+    it('needs no thread data: one PATCH of the message fields keeps a reply draft in its conversation', async () => {
+      const patchRequest = createMockGraphRequest({});
+      mockApiRequests.set('/me/messages/reply-draft-1', patchRequest);
+
+      await adapter.connect({
+        id: 'outlook-1',
+        name: 'Test',
+        provider: 'outlook',
+        email: 'test@outlook.com',
+        oauth: { access_token: 'token', refresh_token: 'rt', expiry: '' },
+      });
+
+      const result = await adapter.updateDraft('reply-draft-1', {
+        to: [{ email: 'client@test.com' }],
+        subject: 'Re: x',
+        body: { text: 'Second version' },
+      });
+
+      expect(result.id).toBe('reply-draft-1');
+      expect(patchRequest.patch).toHaveBeenCalledTimes(1);
+      expect(patchRequest.patch).toHaveBeenCalledWith({
+        subject: 'Re: x',
+        body: { contentType: 'text', content: 'Second version' },
+        toRecipients: [{ emailAddress: { name: undefined, address: 'client@test.com' } }],
+      });
+      // No other request: nothing is read back, recreated or deleted.
+      expect(patchRequest.get).not.toHaveBeenCalled();
+      expect(patchRequest.delete).not.toHaveBeenCalled();
+      expect(defaultMockRequest.get).not.toHaveBeenCalled();
+      expect(defaultMockRequest.post).not.toHaveBeenCalled();
+    });
+
     it('replaces existing attachments when new ones are given', async () => {
       mockApiRequests.set('/me/messages/draft-123', createMockGraphRequest({}));
       const listRequest = createMockGraphRequest({ value: [{ id: 'old-1' }] });
@@ -660,6 +923,115 @@ describe('OutlookAdapter', () => {
 
       expect(deleteRequest.delete).toHaveBeenCalled();
       expect(listRequest.post).toHaveBeenCalledWith(expect.objectContaining({ name: 'new.pdf' }));
+      // New files go up before the old ones are removed.
+      expect((listRequest.post as any).mock.invocationCallOrder[0]).toBeLessThan(
+        (deleteRequest.delete as any).mock.invocationCallOrder[0],
+      );
+    });
+
+    const outlookAccount = {
+      id: 'outlook-1',
+      name: 'Test',
+      provider: 'outlook' as const,
+      email: 'test@outlook.com',
+      oauth: { access_token: 'token', refresh_token: 'rt', expiry: '' },
+    };
+    const draft = { to: [{ email: 'bob@test.com' }], subject: 'Updated Subject', body: { text: 'Updated body' } };
+
+    it('keeps the old files when uploading a new one fails', async () => {
+      mockApiRequests.set('/me/messages/draft-123', createMockGraphRequest({}));
+      const listRequest = createMockGraphRequest({ value: [{ id: 'old-1' }] });
+      listRequest.post = vi.fn().mockRejectedValue(new Error('upload failed'));
+      mockApiRequests.set('/me/messages/draft-123/attachments', listRequest);
+      const deleteRequest = createMockGraphRequest();
+      mockApiRequests.set('/me/messages/draft-123/attachments/old-1', deleteRequest);
+      await adapter.connect(outlookAccount);
+
+      await expect(
+        adapter.updateDraft('draft-123', {
+          ...draft,
+          attachments: [{ filename: 'new.pdf', content: Buffer.from('new'), contentType: 'application/pdf' }],
+        }),
+      ).rejects.toThrow('upload failed');
+      expect(deleteRequest.delete).not.toHaveBeenCalled();
+    });
+
+    it('removes every file when given an empty list', async () => {
+      mockApiRequests.set('/me/messages/draft-123', createMockGraphRequest({}));
+      const listRequest = createMockGraphRequest({ value: [{ id: 'old-1' }, { id: 'old-2' }] });
+      mockApiRequests.set('/me/messages/draft-123/attachments', listRequest);
+      const delete1 = createMockGraphRequest();
+      const delete2 = createMockGraphRequest();
+      mockApiRequests.set('/me/messages/draft-123/attachments/old-1', delete1);
+      mockApiRequests.set('/me/messages/draft-123/attachments/old-2', delete2);
+      await adapter.connect(outlookAccount);
+
+      await adapter.updateDraft('draft-123', { ...draft, attachments: [] });
+
+      expect(listRequest.post).not.toHaveBeenCalled();
+      expect(delete1.delete).toHaveBeenCalled();
+      expect(delete2.delete).toHaveBeenCalled();
+    });
+
+    it('removes old files from every page of the list', async () => {
+      mockApiRequests.set('/me/messages/draft-123', createMockGraphRequest({}));
+      const nextLink = 'https://graph.microsoft.com/v1.0/me/messages/draft-123/attachments?$skip=1';
+      const listRequest = createMockGraphRequest({ value: [{ id: 'old-1' }], '@odata.nextLink': nextLink });
+      mockApiRequests.set('/me/messages/draft-123/attachments', listRequest);
+      mockApiRequests.set(nextLink, createMockGraphRequest({ value: [{ id: 'old-2' }] }));
+      const delete1 = createMockGraphRequest();
+      const delete2 = createMockGraphRequest();
+      mockApiRequests.set('/me/messages/draft-123/attachments/old-1', delete1);
+      mockApiRequests.set('/me/messages/draft-123/attachments/old-2', delete2);
+      await adapter.connect(outlookAccount);
+
+      await adapter.updateDraft('draft-123', {
+        ...draft,
+        attachments: [{ filename: 'new.pdf', content: Buffer.from('new'), contentType: 'application/pdf' }],
+      });
+
+      expect(delete1.delete).toHaveBeenCalled();
+      expect(delete2.delete).toHaveBeenCalled();
+    });
+
+    it('follows every page of the list, however many there are', async () => {
+      mockApiRequests.set('/me/messages/draft-123', createMockGraphRequest({}));
+      const pages = 105;
+      const link = (n: number) => `https://graph.microsoft.com/v1.0/me/messages/draft-123/attachments?$skip=${n}`;
+      mockApiRequests.set(
+        '/me/messages/draft-123/attachments',
+        createMockGraphRequest({ value: [{ id: 'old-0' }], '@odata.nextLink': link(1) }),
+      );
+      for (let n = 1; n < pages; n += 1) {
+        mockApiRequests.set(
+          link(n),
+          createMockGraphRequest(n === pages - 1 ? { value: [{ id: `old-${n}` }] } : { value: [{ id: `old-${n}` }], '@odata.nextLink': link(n + 1) }),
+        );
+      }
+      const deletes = Array.from({ length: pages }, (_, n) => {
+        const request = createMockGraphRequest();
+        mockApiRequests.set(`/me/messages/draft-123/attachments/old-${n}`, request);
+        return request;
+      });
+      await adapter.connect(outlookAccount);
+
+      await adapter.updateDraft('draft-123', { ...draft, attachments: [] });
+
+      for (const request of deletes) expect(request.delete).toHaveBeenCalled();
+    });
+
+    it('refuses a file over 3 MB before touching the draft', async () => {
+      const patchRequest = createMockGraphRequest({});
+      mockApiRequests.set('/me/messages/draft-123', patchRequest);
+      await adapter.connect(outlookAccount);
+
+      await expect(
+        adapter.updateDraft('draft-123', {
+          ...draft,
+          attachments: [{ filename: 'big.zip', content: Buffer.alloc(3 * 1024 * 1024 + 1), contentType: 'application/zip' }],
+        }),
+      ).rejects.toThrow(/Outlook accepts attachments up to 3\.0 MB.*big\.zip/);
+      expect(patchRequest.patch).not.toHaveBeenCalled();
     });
 
     it('leaves attachments alone when none are given', async () => {
@@ -992,6 +1364,18 @@ describe('OutlookAdapter', () => {
         { id: 'r2', matchType: 'headerContains', value: 'in2.getdrip.com', action: 'moveToJunk', createdAt: '' },
       ]);
     });
+
+    it('leaves forwarding rules out: they are forward rules, not block rules', async () => {
+      await connectAdapter();
+      setRules([
+        { id: 'r1', conditions: { senderContains: ['bad.com'] }, actions: { delete: true } },
+        { id: 'r2', conditions: { senderContains: ['vendor.com'] }, actions: { forwardTo: [{ emailAddress: { address: 'expenses@example.com' } }] } },
+        { id: 'r3', conditions: { senderContains: ['other.com'] }, actions: { redirectTo: [{ emailAddress: { address: 'books@example.com' } }] } },
+      ]);
+
+      const rules = await adapter.listBlockRules();
+      expect(rules.map((r) => r.id)).toEqual(['r1']);
+    });
   });
 
   describe('deleteBlockRule', () => {
@@ -1003,6 +1387,122 @@ describe('OutlookAdapter', () => {
       await adapter.deleteBlockRule('rule-1');
 
       expect(deleteReq.delete).toHaveBeenCalled();
+    });
+  });
+
+  function setRules(value: unknown[], created: unknown = { id: 'rule-new' }) {
+    const rulesReq = createMockGraphRequest();
+    rulesReq.get = vi.fn().mockResolvedValue({ value });
+    rulesReq.post = vi.fn().mockResolvedValue(created);
+    mockApiRequests.set('/me/mailFolders/inbox/messageRules', rulesReq);
+    return rulesReq;
+  }
+
+  describe('createForwardRule', () => {
+    const rule = { matchType: 'senderDomain' as const, value: 'vendor.com', forwardTo: 'expenses@example.com', keepInInbox: true };
+
+    it('creates a rule that forwards and leaves the original in the inbox', async () => {
+      await connectAdapter();
+      const rulesReq = setRules([{ id: 'r1', conditions: { senderContains: ['bad.com'] }, actions: { delete: true } }]);
+
+      const result = await adapter.createForwardRule(rule);
+
+      expect(rulesReq.post).toHaveBeenCalledWith({
+        displayName: 'email-mcp: forward senderDomain "vendor.com" to expenses@example.com',
+        sequence: 2,
+        isEnabled: true,
+        conditions: { senderContains: ['vendor.com'] },
+        actions: { forwardTo: [{ emailAddress: { address: 'expenses@example.com' } }] },
+      });
+      expect(result).toEqual({ id: 'rule-new' });
+    });
+
+    it('also moves the original to the archive when keepInInbox is false', async () => {
+      await connectAdapter();
+      const rulesReq = setRules([]);
+
+      await adapter.createForwardRule({ ...rule, keepInInbox: false });
+
+      expect(rulesReq.post).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actions: {
+            forwardTo: [{ emailAddress: { address: 'expenses@example.com' } }],
+            moveToFolder: 'archive',
+            stopProcessingRules: true,
+          },
+        }),
+      );
+    });
+
+    it('returns the existing rule when the same match already forwards to the same address', async () => {
+      await connectAdapter();
+      const rulesReq = setRules([
+        { id: 'r7', conditions: { senderContains: ['vendor.com'] }, actions: { forwardTo: [{ emailAddress: { address: 'Expenses@Example.com' } }] } },
+      ]);
+
+      const result = await adapter.createForwardRule(rule);
+
+      expect(result).toEqual({ id: 'r7', alreadyExisted: true });
+      expect(rulesReq.post).not.toHaveBeenCalled();
+    });
+
+    it('creates a new rule when the match is the same but the target differs', async () => {
+      await connectAdapter();
+      const rulesReq = setRules([
+        { id: 'r7', conditions: { senderContains: ['vendor.com'] }, actions: { forwardTo: [{ emailAddress: { address: 'books@example.com' } }] } },
+      ]);
+
+      const result = await adapter.createForwardRule(rule);
+
+      expect(result).toEqual({ id: 'rule-new' });
+      expect(rulesReq.post).toHaveBeenCalled();
+    });
+  });
+
+  describe('listForwardRules', () => {
+    it('returns only rules that forward or redirect, with targets and inbox behaviour', async () => {
+      await connectAdapter();
+      setRules([
+        { id: 'r1', conditions: { senderContains: ['bad.com'] }, actions: { delete: true } },
+        { id: 'r2', conditions: { senderContains: ['vendor.com'] }, actions: { forwardTo: [{ emailAddress: { address: 'expenses@example.com' } }] } },
+        { id: 'r3', conditions: { subjectContains: ['Invoice'] }, actions: { redirectTo: [{ emailAddress: { address: 'books@example.com' } }], moveToFolder: 'archive' } },
+      ]);
+
+      expect(await adapter.listForwardRules()).toEqual([
+        { id: 'r2', matchType: 'senderDomain', value: 'vendor.com', forwardTo: 'expenses@example.com', keepInInbox: true, createdAt: '' },
+        { id: 'r3', matchType: 'subjectContains', value: 'Invoice', forwardTo: 'books@example.com', keepInInbox: false, createdAt: '' },
+      ]);
+    });
+
+    it('is empty for an account without rules', async () => {
+      await connectAdapter();
+      setRules([]);
+      expect(await adapter.listForwardRules()).toEqual([]);
+    });
+  });
+
+  describe('deleteForwardRule', () => {
+    it('deletes a forwarding rule by id', async () => {
+      await connectAdapter();
+      setRules([
+        { id: 'rule-2', conditions: { senderContains: ['vendor.com'] }, actions: { forwardTo: [{ emailAddress: { address: 'expenses@example.com' } }] } },
+      ]);
+      const deleteReq = createMockGraphRequest({});
+      mockApiRequests.set('/me/mailFolders/inbox/messageRules/rule-2', deleteReq);
+
+      await adapter.deleteForwardRule('rule-2');
+
+      expect(deleteReq.delete).toHaveBeenCalled();
+    });
+
+    it('refuses an id that is not a forwarding rule, so a block rule is not removed by mistake', async () => {
+      await connectAdapter();
+      setRules([{ id: 'rule-1', conditions: { senderContains: ['bad.com'] }, actions: { delete: true } }]);
+      const deleteReq = createMockGraphRequest({});
+      mockApiRequests.set('/me/mailFolders/inbox/messageRules/rule-1', deleteReq);
+
+      await expect(adapter.deleteForwardRule('rule-1')).rejects.toThrow(/No forwarding rule with id rule-1/);
+      expect(deleteReq.delete).not.toHaveBeenCalled();
     });
   });
 });

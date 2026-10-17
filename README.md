@@ -76,6 +76,8 @@ The wizard asks which Gmail permission scope to authorize:
 
 Pass `--scope full` or `--scope restricted` to skip the prompt, or set `EMAIL_MCP_GMAIL_SCOPE=restricted` in the environment the wizard runs in.
 
+> **Verification status (1 October 2026):** Google's review of the shared OAuth app is still running, so Google currently only lets accounts on its test-user list sign in through it; everyone else sees the "has not completed the Google verification process" screen and needs their own OAuth app (next note). The last open step for the shared app is a yearly independent security assessment (CASA, Cloud Application Security Assessment) that Google has requested. Because email-mcp has no server of its own, its applicability is being clarified with Google. Details and current status: [email.lumitra.co/privacy#google-verification](https://email.lumitra.co/privacy#google-verification), tracked in [issue #1](https://github.com/marlinjai/email-mcp/issues/1).
+
 > **Note:** If you prefer to use your own OAuth app instead of the shared one this package ships with, create a Desktop OAuth 2.0 Client in the [Google Cloud Console](https://console.cloud.google.com/) with the Gmail API enabled, then set `EMAIL_MCP_GMAIL_CLIENT_ID` and `EMAIL_MCP_GMAIL_CLIENT_SECRET` in the environment before running the setup wizard (and in the MCP server's environment, since re-authentication uses the same variables). This gives you your own token lifecycle, independent of the publisher's Cloud project, and sidesteps Google's unverified-app warning and 100-test-user cap for your own account(s) once you add yourself as a test user on your own app.
 
 ### Outlook
@@ -115,7 +117,7 @@ npx -y -p @marlinjai/email-mcp@latest email-mcp-setup
 # Optionally enter SMTP host and port for sending
 ```
 
-## Available Tools (32)
+## Available Tools (37)
 
 ### Account Management (4)
 
@@ -132,22 +134,42 @@ npx -y -p @marlinjai/email-mcp@latest email-mcp-setup
 |------|-------------|
 | `email_list_folders` | List all folders/labels for an account |
 | `email_search` | Search emails with filters. Returns compact results by default (`returnBody=false`). Set `returnBody=true` to include full email bodies |
-| `email_get` | Get full email content by ID (headers, body, attachment metadata) |
-| `email_get_thread` | Get an entire email thread/conversation |
-| `email_get_attachment` | Download a specific attachment by ID (returns base64 data) |
-| `email_save_attachment` | Download an attachment directly to disk, returning metadata only — avoids the token cost of round-tripping large files as base64. `outputPath` is relative to a fixed downloads directory (`~/.email-mcp/downloads`, override with `EMAIL_MCP_DOWNLOADS_DIR`) and cannot escape it |
+| `email_get` | Get full email content by ID (headers, body, attachment metadata). `sourceFolder` names the folder on iCloud/IMAP when the message is not in INBOX |
+| `email_get_thread` | Get an entire email thread/conversation. On iCloud/IMAP a thread is searched in one folder: INBOX, or the one named in `sourceFolder` |
+| `email_get_attachment` | Download a specific attachment by ID (returns base64 data). `sourceFolder` names the folder on iCloud/IMAP when the message is not in INBOX |
+| `email_save_attachment` | Download an attachment directly to disk, returning metadata only, which avoids the token cost of round-tripping large files as base64. `outputPath` is relative to a fixed downloads directory (`~/.email-mcp/downloads`, override with `EMAIL_MCP_DOWNLOADS_DIR`) and cannot escape it. `sourceFolder` as on `email_get_attachment` |
 
 ### Sending & Drafts (6)
 
-`email_send`, `email_reply`, `email_forward`, `email_draft_create` and `email_draft_update` take an optional `attachments` list. Each entry is either `{ path }` (an absolute path to a local file, read by the server) or `{ content, filename }` (base64), with an optional `contentType` (inferred from the extension otherwise). The total is capped at 25 MB.
+`email_send`, `email_reply`, `email_forward`, `email_draft_create` and `email_draft_update` take an optional `attachments` list. Each entry is either `{ path }` (a file in the attachments folder, see below) or `{ content, filename }` (base64), with an optional `contentType` (inferred from the extension otherwise). The total is capped at 25 MB; Outlook accepts up to 3 MB per message through this server. On `email_draft_update` a list replaces the draft's files, an empty list removes them, and no list keeps the files the draft has.
+
+Replies stay in their thread: `email_reply` sends inside the original conversation on Gmail and Outlook (and sets the `In-Reply-To` and `References` headers everywhere), `email_draft_create` with `inReplyToEmailId` saves a reply draft in that thread, and `email_draft_update` keeps a reply draft there.
+
+**Forwarding the original message's attachments is opt-in.** `email_forward` sends the text of the original; its files go along only with `includeOriginalAttachments: true`, so one call does not pass files the assistant never looked at on to another address. Forwarded files count against the 25 MB cap together with added ones.
+
+**Attaching files by path is off until you name a folder.** The path comes from the assistant, and an assistant that reads mail can be asked by a mail to attach something it should not (a private key, for example). So files are only read from the one folder you set in `EMAIL_MCP_ATTACHMENTS_DIR`, in the environment of the server; no tool can change it. Put the file there and ask for it by name:
+
+```json
+{
+  "mcpServers": {
+    "email": {
+      "command": "npx",
+      "args": ["@marlinjai/email-mcp"],
+      "env": { "EMAIL_MCP_ATTACHMENTS_DIR": "~/Documents/email-outbox" }
+    }
+  }
+}
+```
+
+A path outside that folder is refused, as is a symbolic link that leads out of it, and email-mcp's own data files are never attachable.
 
 | Tool | Description |
 |------|-------------|
 | `email_send` | Compose and send a new email (to, cc, bcc, subject, body, attachments) |
-| `email_reply` | Reply to an email in its thread (reply-all; optional `to`/`cc`/`bcc` overrides and `additionalRecipients`, e.g. when replying to your own sent message) |
-| `email_forward` | Forward an email to new recipients (cc/bcc; includes the original attachments unless `includeOriginalAttachments: false`) |
-| `email_draft_create` | Save a draft without sending (attachments supported; `inReplyToEmailId` saves it as a reply inside that thread) |
-| `email_draft_update` | Update an existing draft in place. On Gmail/Outlook the draft id is unchanged; on iCloud/generic IMAP there's no in-place update (IMAP messages are immutable), so the old draft is deleted and a new one appended — the returned id is a **new** id, always use it going forward |
+| `email_reply` | Reply to an email in its thread. `replyAll` addresses the sender and all To/Cc recipients except your own address, each once. Optional `to`/`cc`/`bcc` overrides and `additionalRecipients`, e.g. when replying to your own sent message. Attachments supported. `sourceFolder` names the folder on iCloud/IMAP when the message is not in INBOX |
+| `email_forward` | Forward an email to new recipients (`to`, `cc`, `bcc`, optional text on top, attachments). The original's attachments are left out unless `includeOriginalAttachments: true`. `sourceFolder` names the folder on iCloud/IMAP when the message is not in INBOX |
+| `email_draft_create` | Save a draft without sending (attachments supported). `inReplyToEmailId` saves it as a reply inside that message's thread (`inReplyToSourceFolder` names that message's folder on iCloud/IMAP when it is not in INBOX) |
+| `email_draft_update` | Update an existing draft in place. A reply draft stays in its thread. On Gmail/Outlook the draft id is unchanged; on iCloud/generic IMAP there's no in-place update (IMAP messages are immutable), so the old draft is deleted and a new one appended: the returned id is a **new** id, always use it going forward |
 | `email_draft_list` | List all drafts |
 
 ### Organization (8)
@@ -163,13 +185,14 @@ npx -y -p @marlinjai/email-mcp@latest email-mcp-setup
 | `email_get_labels` | List all labels with counts (Gmail only) |
 | `email_get_categories` | List all categories (Outlook only) |
 
-### Batch Operations (3)
+### Batch Operations (4)
 
 | Tool | Description |
 |------|-------------|
 | `email_batch_delete` | Delete multiple emails at once (up to 1000 for Gmail, batches of 20 for Outlook, UID ranges for IMAP) |
 | `email_batch_move` | Move multiple emails to a folder in a single call |
 | `email_batch_mark` | Mark multiple emails read/unread, starred, or flagged at once |
+| `email_batch_label` | Add or remove labels on multiple emails at once (native batch call on Gmail, one by one elsewhere) |
 
 All batch tools accept a `sourceFolder` parameter for IMAP/iCloud and include a sequential fallback for maximum compatibility.
 
@@ -184,6 +207,56 @@ All batch tools accept a `sourceFolder` parameter for IMAP/iCloud and include a 
 | `email_delete_block_rule` | Delete a standing block rule — use to undo a rule that turned out too broad |
 
 Gmail and Outlook only for the rule tools; `email_report_spam`/`email_batch_report_spam` work on every provider (iCloud/IMAP fall back to a best-effort move into the account's Junk-typed folder, with no vendor ML training signal since generic IMAP has none to train).
+
+### Forwarding Rules (3)
+
+| Tool | Description |
+|------|-------------|
+| `email_create_forward_rule` | Create a standing rule that forwards future mail matching a pattern (sender domain/address, subject, or header content) to another address, for example vendor invoices to a bookkeeping address. The original stays in the inbox unless `keepInInbox` is `false`. Creating the same rule twice returns the existing one |
+| `email_list_forward_rules` | List every rule on an account that forwards mail elsewhere, including rules made by hand in Gmail or Outlook: an audit of where mail is being sent |
+| `email_delete_forward_rule` | Delete a forwarding rule by id |
+
+Gmail and Outlook only. iCloud and generic IMAP have no server-side rule mechanism; set the rule in the provider's own settings there.
+
+**Forwarding is off until you allow a target.** A standing forward rule copies future mail out of your mailbox, and an assistant that reads mail can be asked to create one by the mail it reads. So `email_create_forward_rule` only accepts addresses you listed yourself in `EMAIL_MCP_FORWARD_ALLOWLIST` (comma-separated), in the environment of the server. No tool can change that list:
+
+```json
+{
+  "mcpServers": {
+    "email": {
+      "command": "npx",
+      "args": ["@marlinjai/email-mcp"],
+      "env": { "EMAIL_MCP_FORWARD_ALLOWLIST": "expenses@example.com" }
+    }
+  }
+}
+```
+
+On Gmail the target must also be a forwarding address of the account: add it once under Gmail Settings, "Forwarding and POP/IMAP", "Add a forwarding address", and confirm the email Google sends to it. Outlook needs no such step, which is why the allowlist exists. Outlook accounts authenticated before the block-rule tools existed need to re-run the setup wizard once, as for those tools.
+
+## Usage with Claude Code
+
+Add the following to your `.mcp.json` file (project-level or global `~/.claude/.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "email": {
+      "command": "npx",
+      "args": ["@marlinjai/email-mcp"]
+    }
+  }
+}
+```
+
+Once configured, you can ask Claude to interact with your email:
+
+- "Check my inbox for unread messages"
+- "Search for emails from alice@example.com in the last week"
+- "Reply to the latest email from Bob and thank him"
+- "Move all newsletters to the Archive folder"
+- "Delete all spam emails" (uses batch operations for speed)
+- "Draft a follow-up email to the team about the meeting"
 
 ## Headless fetch (scripts and schedulers)
 
@@ -230,29 +303,22 @@ Every setting is optional and lives in `~/.email-mcp/inbound-digest.json` (or pa
 - `contactsPath` points to `{ "contacts": [{ "id", "name", "emails": [], "domains": [] }] }`; matching senders are listed first under "Contacts waiting".
 - Optional `dismissalsPath`, `blockedSendersPath`, `boardUrl`, `dismissUrl` and `scheduleTime` hook the digest into your own triage tooling.
 
-## Usage with Claude Code
+## VarietyVault fork additions
 
-Add the following to your `.mcp.json` file (project-level or global `~/.claude/.mcp.json`):
+This fork adds a few tools on top of upstream email-mcp:
 
-```json
-{
-  "mcpServers": {
-    "email": {
-      "command": "npx",
-      "args": ["@marlinjai/email-mcp"]
-    }
-  }
-}
-```
-
-Once configured, you can ask Claude to interact with your email:
-
-- "Check my inbox for unread messages"
-- "Search for emails from alice@example.com in the last week"
-- "Reply to the latest email from Bob and thank him"
-- "Move all newsletters to the Archive folder"
-- "Delete all spam emails" (uses batch operations for speed)
-- "Draft a follow-up email to the team about the meeting"
+- **`email_calendar_event_create`** (Outlook only) creates a calendar event, with a Microsoft Teams
+  link by default. With attendees, Outlook sends the invitations immediately, like `email_send`.
+  The calendar permission is separate from mail: grant it once per account with
+  `node dist/cli/grant-calendar.js`.
+- **More headless CLIs** in `dist/cli/`, all using the server's credential store (run them as the
+  user who set the accounts up):
+  - `watcher-fetch.js`: like `email-mcp-fetch`, and also reports `hasAttachments`.
+  - `jev-fetch.js`: read-only fetch with message bodies; never writes the credential files.
+  - `jev-send.js`: sends to the account's own address only (no other recipient is possible).
+  - `inbound-scan.js`: unanswered-inbound digest; settings in `~/.email-mcp/inbound-scan.json`
+    (or `INBOUND_SCAN_CONFIG`), see `inbound-scan.example.json`.
+- **Work and school Microsoft accounts** sign in through the `common` authority.
 
 ## Development
 
@@ -312,7 +378,7 @@ can reach it.
 
 ## Support
 
-If this project is useful to you, consider supporting its development:
+email-mcp is free and has no paid tier. Its one fixed cost is the independent security assessment Google requires every year for the shared Gmail sign-in (CASA, Cloud Application Security Assessment): 675 US dollars a year. It is the last open step before Google lets everyone use the one-command Gmail setup. Donations are collected until 2 November 2026, the day the assessment has to start, and the maintainer pays what is missing then. Progress is shown at [email.lumitra.co](https://email.lumitra.co/#fund-the-audit).
 
 - [GitHub Sponsors](https://github.com/sponsors/marlinjai)
 - [Buy Me a Coffee](https://buymeacoffee.com/marlinjai)

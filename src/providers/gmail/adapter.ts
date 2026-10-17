@@ -14,9 +14,11 @@ import type {
   BatchResult,
   BlockRuleInput,
   BlockRule,
+  ForwardRuleInput,
+  ForwardRule,
 } from '../../models/types.js';
 import { ProviderType } from '../../models/types.js';
-import { mapGmailLabel, mapGmailMessage, buildGmailQuery } from './mapper.js';
+import { mapGmailLabel, mapGmailMessage, buildGmailQuery, extractBody } from './mapper.js';
 import { buildMimeMessage } from '../mime.js';
 
 export class GmailAdapter implements EmailProvider {
@@ -200,11 +202,11 @@ export class GmailAdapter implements EmailProvider {
 
   async sendEmail(params: SendEmailParams): Promise<{ id: string; threadId?: string }> {
     const gmail = this.ensureConnected();
-    const raw = await this.buildRfc2822(params);
+    const raw = await this.buildRaw(params);
 
     const res = await gmail.users.messages.send({
       userId: 'me',
-      requestBody: { raw, ...(params.threadId ? { threadId: params.threadId } : {}) },
+      requestBody: { raw, ...this.threadFor(params) },
     });
 
     return {
@@ -215,27 +217,62 @@ export class GmailAdapter implements EmailProvider {
 
   async createDraft(params: SendEmailParams): Promise<{ id: string }> {
     const gmail = this.ensureConnected();
-    const raw = await this.buildRfc2822(params);
+    const raw = await this.buildRaw(params);
 
     const res = await gmail.users.drafts.create({
       userId: 'me',
       requestBody: {
-        message: { raw, ...(params.threadId ? { threadId: params.threadId } : {}) },
+        message: { raw, ...this.threadFor(params) },
       },
     });
 
     return { id: res.data.id || '' };
   }
 
-  async updateDraft(draftId: string, params: SendEmailParams): Promise<{ id: string }> {
+  /**
+   * drafts.update replaces the whole message, so what the caller does not
+   * name would be lost: a reply draft would fall out of its thread and a
+   * draft's files would be dropped. So when the caller names no thread, the
+   * thread and the reply headers of the stored draft are carried over, and
+   * when the caller names no attachments, the stored draft's files are. A
+   * given list (an empty one included) replaces the files.
+   */
+  async updateDraft(draftId: string, update: SendEmailParams): Promise<{ id: string }> {
     const gmail = this.ensureConnected();
-    const raw = await this.buildRfc2822(params);
+    let params = update;
+    const keepThread = update.threadId === undefined;
+    const keepFiles = update.attachments === undefined;
+    if (keepThread || keepFiles) {
+      const existing = await gmail.users.drafts.get({
+        userId: 'me',
+        id: draftId,
+        // 'metadata' is ids, labels and headers, no body (drafts.get has no
+        // way to ask for single headers, so all of them come back). The parts
+        // that list the files only come with 'full'.
+        format: keepFiles ? 'full' : 'metadata',
+      });
+      const message = existing.data.message;
+      if (keepThread) {
+        const header = (name: string): string | undefined =>
+          (message?.payload?.headers || []).find((h) => (h.name || '').toLowerCase() === name)?.value || undefined;
+        const inReplyTo = update.inReplyTo ?? header('in-reply-to');
+        const references = update.references ?? header('references')?.split(/\s+/).filter(Boolean);
+        if (message?.threadId && inReplyTo) {
+          params = { ...params, threadId: message.threadId, inReplyTo, references: references?.length ? references : [inReplyTo] };
+        }
+      }
+      if (keepFiles && message?.id) {
+        const stored = await this.storedAttachments(message.id, message.payload);
+        if (stored.length) params = { ...params, attachments: stored };
+      }
+    }
+    const raw = await this.buildRaw(params);
 
     const res = await gmail.users.drafts.update({
       userId: 'me',
       id: draftId,
       requestBody: {
-        message: { raw, ...(params.threadId ? { threadId: params.threadId } : {}) },
+        message: { raw, ...this.threadFor(params) },
       },
     });
 
@@ -561,31 +598,47 @@ export class GmailAdapter implements EmailProvider {
     });
   }
 
-  async createBlockRule(rule: BlockRuleInput): Promise<{ id: string }> {
-    const gmail = this.ensureConnected();
+  private filterCriteria(matchType: BlockRuleInput['matchType'], value: string): Record<string, unknown> {
     const criteria: Record<string, unknown> = {};
 
-    switch (rule.matchType) {
+    switch (matchType) {
       case 'senderDomain':
         // Gmail's own filter UI represents "any sender at this domain" as
         // a From value starting with '@' — this is standard filter syntax,
         // not a documented API field, but it's what Gmail itself generates.
-        criteria.from = `@${rule.value}`;
+        criteria.from = `@${value}`;
         break;
       case 'senderAddress':
-        criteria.from = rule.value;
+        criteria.from = value;
         break;
       case 'subjectContains':
-        criteria.subject = rule.value;
+        criteria.subject = value;
         break;
       case 'headerContains':
         // Gmail's filter API has no field for an arbitrary header (e.g.
         // Reply-To). `query` accepts full Gmail search syntax and Gmail
         // indexes most header content for search, so this is the closest
         // available match — a heuristic, not a guaranteed header match.
-        criteria.query = rule.value;
+        criteria.query = value;
         break;
     }
+
+    return criteria;
+  }
+
+  /** The reverse of filterCriteria, for listing. A best-effort reading of filters made elsewhere. */
+  private readCriteria(criteria: any): { matchType: BlockRuleInput['matchType']; value: string } {
+    if (typeof criteria?.from === 'string' && criteria.from.startsWith('@')) {
+      return { matchType: 'senderDomain', value: criteria.from.slice(1) };
+    }
+    if (criteria?.from) return { matchType: 'senderAddress', value: criteria.from };
+    if (criteria?.subject) return { matchType: 'subjectContains', value: criteria.subject };
+    return { matchType: 'headerContains', value: criteria?.query || '' };
+  }
+
+  async createBlockRule(rule: BlockRuleInput): Promise<{ id: string }> {
+    const gmail = this.ensureConnected();
+    const criteria = this.filterCriteria(rule.matchType, rule.value);
 
     // Gmail's filter Action rejects SPAM in addLabelIds ("Invalid label
     // SPAM in AddLabelIds") — confirmed live, not just from docs. Only
@@ -610,25 +663,12 @@ export class GmailAdapter implements EmailProvider {
   async listBlockRules(): Promise<BlockRule[]> {
     const gmail = this.ensureConnected();
     const res = await gmail.users.settings.filters.list({ userId: 'me' });
-    return (res.data.filter || []).map((f: any): BlockRule => {
-      const criteria = f.criteria || {};
+    // A filter that forwards is a forward rule (listForwardRules), not a block rule.
+    return (res.data.filter || []).filter((f: any) => !f.action?.forward).map((f: any): BlockRule => {
       const addLabelIds: string[] = f.action?.addLabelIds || [];
-      let matchType: BlockRuleInput['matchType'] = 'headerContains';
-      let value = criteria.query || '';
-      if (typeof criteria.from === 'string' && criteria.from.startsWith('@')) {
-        matchType = 'senderDomain';
-        value = criteria.from.slice(1);
-      } else if (criteria.from) {
-        matchType = 'senderAddress';
-        value = criteria.from;
-      } else if (criteria.subject) {
-        matchType = 'subjectContains';
-        value = criteria.subject;
-      }
       return {
         id: f.id || '',
-        matchType,
-        value,
+        ...this.readCriteria(f.criteria),
         action: addLabelIds.includes('TRASH') ? 'delete' : 'moveToJunk',
         createdAt: '', // Gmail's filter API does not expose a creation timestamp
       };
@@ -640,8 +680,135 @@ export class GmailAdapter implements EmailProvider {
     await gmail.users.settings.filters.delete({ userId: 'me', id: ruleId });
   }
 
-  private async buildRfc2822(params: SendEmailParams): Promise<string> {
-    const message = await buildMimeMessage(this.email, params, { includeBcc: true });
+  /**
+   * Gmail only forwards to an address the user has added and confirmed under
+   * Settings, "Forwarding and POP/IMAP". Adding one through the API needs a
+   * scope this app does not request (gmail.settings.sharing), so a missing or
+   * unconfirmed address is answered with the manual step, before Gmail's own
+   * less helpful error.
+   */
+  async createForwardRule(rule: ForwardRuleInput): Promise<{ id: string; alreadyExisted?: boolean }> {
+    const gmail = this.ensureConnected();
+    const target = rule.forwardTo.trim().toLowerCase();
+
+    const addresses = await gmail.users.settings.forwardingAddresses.list({ userId: 'me' });
+    const known = (addresses.data.forwardingAddresses || []).find(
+      (a: any) => (a.forwardingEmail || '').toLowerCase() === target,
+    );
+    if (!known) {
+      throw new Error(
+        `${rule.forwardTo} is not a forwarding address of this Gmail account yet. Add it once in Gmail under Settings, "Forwarding and POP/IMAP", "Add a forwarding address", confirm the email Google sends to it, then run this again.`,
+      );
+    }
+    if (known.verificationStatus !== 'accepted') {
+      throw new Error(
+        `${rule.forwardTo} was added to this Gmail account but not confirmed yet. Open the confirmation email Google sent to that address, confirm it, then run this again.`,
+      );
+    }
+
+    const existing = (await this.listForwardRules()).find(
+      (r) => r.matchType === rule.matchType
+        && r.value.toLowerCase() === rule.value.toLowerCase()
+        && r.forwardTo.toLowerCase() === target,
+    );
+    if (existing) return { id: existing.id, alreadyExisted: true };
+
+    const action: Record<string, unknown> = { forward: known.forwardingEmail };
+    if (!rule.keepInInbox) action.removeLabelIds = ['INBOX'];
+
+    const res = await gmail.users.settings.filters.create({
+      userId: 'me',
+      requestBody: { criteria: this.filterCriteria(rule.matchType, rule.value), action },
+    });
+
+    return { id: res.data.id || '' };
+  }
+
+  /** Every filter that forwards, including ones made by hand in Gmail. */
+  async listForwardRules(): Promise<ForwardRule[]> {
+    const gmail = this.ensureConnected();
+    const res = await gmail.users.settings.filters.list({ userId: 'me' });
+    return (res.data.filter || []).filter((f: any) => f.action?.forward).map((f: any): ForwardRule => ({
+      id: f.id || '',
+      ...this.readCriteria(f.criteria),
+      forwardTo: f.action.forward,
+      keepInInbox: !(f.action.removeLabelIds || []).includes('INBOX'),
+      createdAt: '', // Gmail's filter API does not expose a creation timestamp
+    }));
+  }
+
+  async deleteForwardRule(ruleId: string): Promise<void> {
+    const rules = await this.listForwardRules();
+    if (!rules.some((r) => r.id === ruleId)) {
+      throw new Error(`No forwarding rule with id ${ruleId} on this account. Use email_list_forward_rules to see the ids.`);
+    }
+    await this.deleteBlockRule(ruleId);
+  }
+
+  /**
+   * Gmail files a message into an existing thread only when the threadId
+   * comes with In-Reply-To and References headers and a subject (which has to
+   * match the thread's; the reply tool builds "Re: <original subject>"). A
+   * threadId without them is left out, and the message starts its own thread.
+   */
+  private threadFor(params: SendEmailParams): { threadId?: string } {
+    const belongs = params.threadId && params.inReplyTo && params.references?.length && params.subject.trim();
+    return belongs ? { threadId: params.threadId } : {};
+  }
+
+  /**
+   * The files of a stored message, with their bytes: every part that has a
+   * file name, at any depth. Large files are referenced by an attachment id
+   * and fetched; small ones can come inline in the part. A fetch that fails
+   * is not swallowed: a draft update built on it would drop that file.
+   */
+  private async storedAttachments(
+    messageId: string,
+    payload: gmail_v1.Schema$MessagePart | undefined,
+  ): Promise<NonNullable<SendEmailParams['attachments']>> {
+    const gmail = this.ensureConnected();
+    const files: NonNullable<SendEmailParams['attachments']> = [];
+    const html = (extractBody(payload).html || '').toLowerCase();
+    const visit = async (part: gmail_v1.Schema$MessagePart | undefined): Promise<void> => {
+      if (!part) return;
+      // An image the HTML body embeds (inline, addressed by Content-ID and
+      // referenced as cid: in the old HTML) belongs to the old body, which the
+      // update replaces. It is not a file. An inline part the HTML does not
+      // reference is a file another client attached, so it is kept.
+      const partHeader = (name: string) =>
+        (part.headers || []).find((h) => (h.name || '').toLowerCase() === name)?.value || '';
+      const contentId = partHeader('content-id').trim().replace(/^<|>$/g, '').toLowerCase();
+      const embedded =
+        /^\s*inline/i.test(partHeader('content-disposition')) && contentId !== '' && html.includes(`cid:${contentId}`);
+      if (part.filename && !embedded) {
+        let data = part.body?.data;
+        if (!data && part.body?.attachmentId) {
+          const res = await gmail.users.messages.attachments.get({ userId: 'me', messageId, id: part.body.attachmentId });
+          data = res.data.data;
+        }
+        if (data === undefined || data === null) {
+          throw new Error(`Could not read the draft's attachment ${part.filename}; the draft was not changed.`);
+        }
+        files.push({
+          filename: part.filename,
+          content: Buffer.from(data, 'base64url'),
+          contentType: part.mimeType || 'application/octet-stream',
+        });
+      }
+      for (const child of part.parts || []) await visit(child);
+    };
+    await visit(payload);
+    return files;
+  }
+
+  /**
+   * Builds the base64url `raw` payload Gmail expects for send, draft create and
+   * draft update: a full MIME message with a text part, an HTML part when one
+   * was given (or a text part derived from HTML-only input), encoded headers
+   * and any attachments. See `buildMimeMessage`.
+   */
+  private async buildRaw(params: SendEmailParams): Promise<string> {
+    const message = await buildMimeMessage(this.email, params);
     return message.toString('base64url');
   }
 }

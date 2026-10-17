@@ -59,7 +59,7 @@ function decodeBase64Url(data: string): string {
   return Buffer.from(data, 'base64url').toString('utf-8');
 }
 
-function extractBody(
+export function extractBody(
   payload: any,
 ): { text?: string; html?: string } {
   const result: { text?: string; html?: string } = {};
@@ -116,6 +116,17 @@ function extractAttachments(payload: any): AttachmentMeta[] {
   return attachments;
 }
 
+// The headers a reply is built from, under lower-case names like the IMAP
+// mapper uses. Without them a reply has no Message-ID to point at.
+function threadingHeaders(headers: any[]): Record<string, string> | undefined {
+  const picked: Record<string, string> = {};
+  for (const name of ['Message-ID', 'In-Reply-To', 'References']) {
+    const value = getHeader(headers, name);
+    if (value) picked[name.toLowerCase()] = value;
+  }
+  return Object.keys(picked).length > 0 ? picked : undefined;
+}
+
 export function mapGmailMessage(message: any, accountId: string): Email {
   const headers = message.payload?.headers || [];
   const labelIds: string[] = message.labelIds || [];
@@ -157,6 +168,7 @@ export function mapGmailMessage(message: any, accountId: string): Email {
     snippet: message.snippet,
     attachments,
     labels: labelIds,
+    headers: threadingHeaders(headers),
     flags: {
       read: !labelIds.includes('UNREAD'),
       starred: labelIds.includes('STARRED'),

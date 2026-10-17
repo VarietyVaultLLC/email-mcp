@@ -10,6 +10,8 @@ import type {
   BatchResult,
   BlockRuleInput,
   BlockRule,
+  ForwardRuleInput,
+  ForwardRule,
 } from '../models/types.js';
 
 export interface SendEmailParams {
@@ -22,7 +24,9 @@ export interface SendEmailParams {
   inReplyTo?: string;
   references?: string[];
   /** Gmail thread to join. Header-based threading alone does not place a
-   *  message in a Gmail thread; the API needs the threadId as well. */
+   *  message in a Gmail thread; the API needs the threadId as well. Gmail in
+   *  turn only accepts it next to In-Reply-To, References and a subject, so
+   *  the adapter leaves it out when one of those is missing. */
   threadId?: string;
   /** Outlook: Graph item id of the message being replied to. Graph threads a
    *  reply only through createReply, which needs this id (not the RFC
@@ -41,9 +45,14 @@ export interface EmailProvider {
   createFolder(name: string, parentPath?: string): Promise<Folder>;
 
   search(query: SearchQuery): Promise<Email[]>;
-  getEmail(id: string): Promise<Email>;
-  getThread(threadId: string): Promise<Thread>;
-  getAttachment(emailId: string, attachmentId: string): Promise<{ data: Buffer; meta: AttachmentMeta }>;
+  // `sourceFolder` on getEmail and getAttachment: IMAP and iCloud ids are
+  // UIDs, which only mean something inside one folder, so a message outside
+  // INBOX needs its folder named. Gmail and Outlook ids are global and those
+  // adapters ignore it. On getThread it is the one folder IMAP and iCloud
+  // search for the thread's messages (INBOX when omitted).
+  getEmail(id: string, sourceFolder?: string): Promise<Email>;
+  getThread(threadId: string, sourceFolder?: string): Promise<Thread>;
+  getAttachment(emailId: string, attachmentId: string, sourceFolder?: string): Promise<{ data: Buffer; meta: AttachmentMeta }>;
 
   sendEmail(params: SendEmailParams): Promise<{ id: string; threadId?: string }>;
   createDraft(params: SendEmailParams): Promise<{ id: string }>;
@@ -92,4 +101,13 @@ export interface EmailProvider {
   createBlockRule?(rule: BlockRuleInput): Promise<{ id: string }>;
   listBlockRules?(): Promise<BlockRule[]>;
   deleteBlockRule?(ruleId: string): Promise<void>;
+
+  // Forwarding rules (optional, Gmail and Outlook only; see
+  // docs/plans/2026-10-02-forward-rules.md). The allowlist check on the
+  // target address happens in the tool layer, before any of these is called.
+  // createForwardRule returns the existing rule's id with alreadyExisted set
+  // when the same match already forwards to the same address.
+  createForwardRule?(rule: ForwardRuleInput): Promise<{ id: string; alreadyExisted?: boolean }>;
+  listForwardRules?(): Promise<ForwardRule[]>;
+  deleteForwardRule?(ruleId: string): Promise<void>;
 }

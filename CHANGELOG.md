@@ -7,21 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-- **Outgoing attachments.** `email_send`, `email_reply`, `email_forward`, `email_draft_create` and `email_draft_update` accept an `attachments` list: a local file by absolute `path`, or base64 `content` with a `filename`. The MIME type is inferred from the extension unless `contentType` is given, and the total is capped at 25 MB. On `email_draft_update`, given attachments replace the draft's current ones.
+### Added (VarietyVault fork)
+- **Headless CLIs for schedulers.** `email-mcp-fetch` and `email-mcp-digest` (installed bins), plus
+  `dist/cli/watcher-fetch.js`, `jev-fetch.js`, `jev-send.js` (self-send only) and `inbound-scan.js`
+  (settings in `~/.email-mcp/inbound-scan.json`, see `inbound-scan.example.json`).
+- **`email_calendar_event_create`** (Outlook): creates a calendar event with a Teams link. The calendar
+  permission is granted once per account with `node dist/cli/grant-calendar.js`.
+- `Email` gains `hasAttachments`, and Outlook messages carry `inferenceClassification` and `webLink`.
 
-- **Reply drafts.** `email_draft_create` takes `inReplyToEmailId` and saves the draft as a reply in that message's thread, so a reply can be reviewed before it is sent.
-- **Reply recipients.** `email_reply` takes `to`, `cc`, `bcc` and `additionalRecipients`. Without `to`, replying to a message you sent yourself addressed the reply back to you.
-- **Forward cc/bcc and original attachments.** `email_forward` takes `cc` and `bcc`, and now carries the original message's attachments (turn off with `includeOriginalAttachments: false`).
+### Fixed (VarietyVault fork)
+- **Work and school Microsoft accounts.** Outlook sign-in uses the `common` authority, and silent
+  refresh asks only for the mail scopes, so accounts consented before `MailboxSettings.ReadWrite`
+  keep working instead of failing every call with AADSTS65001.
+- **Outlook search by subject or body** failed because Graph rejects `$orderby` with `$search`.
+- **Concurrent writers.** `credentials.enc` and the MSAL cache are written atomically under a
+  cross-process lock, so several server processes and CLIs no longer drop each other's updates.
 
-- **`email-mcp-fetch`, a headless fetch CLI.** Lists messages since a date as JSON, or saves one attachment to a file, without starting the MCP server, so schedulers and scripts in other languages can read mail through the same accounts and credential store.
-- **`email-mcp-digest`, an unanswered-inbound digest.** Scans every account for threads still waiting on your reply, filters bulk mail deterministically, and emails one digest; settings in `~/.email-mcp/inbound-digest.json`.
-- **More message metadata.** `Email` gains `hasAttachments` (set even when search results carry no attachment list), and Outlook messages carry `inferenceClassification` (Focused Inbox verdict) and `webLink`.
+### Changed (VarietyVault fork)
+- Dependency bumps for security alerts: nodemailer 10, vitest 4.1; Node 20 or newer.
+
+## [1.10.1] - 2026-10-04
+
+Drafts keep their attachments. A patch release: one fix, no tool or input changed.
 
 ### Fixed
-- **Replies did not stay in their thread on Gmail and Outlook.** Gmail places a message in a thread only when the API call carries the `threadId`; headers alone start a new conversation. Outlook threads only through Graph's `createReply`, and `/me/sendMail` always started a new conversation. Replies now pass the Gmail `threadId` and go through `createReply` on Outlook (the reply body replaces Graph's pre-filled quote).
-- **Gmail dropped attachments and sent HTML as plain text.** The Gmail send and draft paths built a single `text/plain` part by hand, so `SendEmailParams.attachments` were ignored and an HTML body arrived as literal markup. Gmail messages and IMAP drafts are now built with nodemailer's MailComposer (already a dependency), which produces the proper multipart structure.
-- **Outlook and IMAP drafts dropped attachments.** Outlook `createDraft` and `updateDraft` now carry attachments (update replaces them explicitly, since a Graph PATCH cannot), and IMAP drafts include them in the appended message.
+- **Updating a draft no longer drops its attachments on Gmail, iCloud and IMAP.** `email_draft_update` rebuilds the message on those providers, so a draft lost its files whenever they were not passed again. When no `attachments` are given, the stored draft's files are now carried over into the new version, as Outlook already did. A list still replaces them and an empty list removes them. Images embedded in the old body are not carried over, since the body is replaced. If one of the stored files cannot be read, the update fails and the draft is left unchanged.
+
+## [1.10.0] - 2026-10-03
+
+Attachments and replies that stay in their thread. A minor release: new inputs on existing tools and one new setting, no tool renamed or removed. Two things behave differently after upgrading, both under "Changed": the `headers` of a message on iCloud and IMAP, and reply-all recipients.
+
+### Added
+- **Attachments on outgoing mail.** `email_send`, `email_reply`, `email_forward`, `email_draft_create` and `email_draft_update` take an `attachments` list: `{ path }` or `{ content, filename }` (base64), with an optional `contentType`. The total is capped at 25 MB and checked before any file is read. Contributed by @jonboy648 (#20).
+- **`EMAIL_MCP_ATTACHMENTS_DIR`: the one folder files may be attached from.** Attaching by path is off until this is set in the server's environment. A path outside the folder, a symbolic link leading out of it and email-mcp's own data files are refused, so a mail that asks the assistant to attach a private key cannot get its way. Content passed directly as base64 works without it.
+- **Reply drafts: `email_draft_create` takes `inReplyToEmailId`.** The draft is saved as a reply inside that message's thread (the Gmail thread, an Outlook reply draft made with Graph's `createReply`, `In-Reply-To` and `References` headers on iCloud and IMAP), so it can be reviewed before it is sent. Contributed by @jonboy648 (#21).
+- **Reply recipients: `email_reply` takes `to`, `cc`, `bcc` and `additionalRecipients`.** `to` replaces the default recipient (the original sender), which is what a reply to your own sent message needs; `additionalRecipients` adds people to it without duplicates; `cc` replaces the Cc carried over by `replyAll`, and an empty list clears it. An empty `to` counts as not given. Contributed by @jonboy648 (#21).
+- **`email_forward` takes `cc` and `bcc`, and can forward the original attachments.** The original message's files go along only with `includeOriginalAttachments: true`. It is off by default, so that a single call does not send files the assistant never looked at to another address. Forwarded files count against the 25 MB cap together with added ones, checked by their listed sizes before anything is downloaded and again on the downloaded bytes. Contributed by @jonboy648 (#21), opt-in default and the cap added on top.
+- **`sourceFolder` wherever one message is read by id.** `email_get`, `email_reply`, `email_forward`, `email_get_attachment` and `email_save_attachment` take `sourceFolder`, and `email_draft_create` takes `inReplyToSourceFolder` for the message named in `inReplyToEmailId` (the draft itself goes to Drafts). It names the folder on iCloud and IMAP when the message is not in INBOX, like the same input on the move, delete and mark tools. `email_get_thread` takes it too: on iCloud and IMAP a thread is searched in one folder, INBOX unless another is named. Gmail and Outlook ignore it.
+- **Outlook drafts carry attachments.** `email_draft_create` attaches them, and `email_draft_update` replaces the draft's files when a list is given (new files are uploaded before the old ones are removed, an empty list removes them all, no list leaves them alone).
+
+### Changed
+- **Outlook refuses attachments over 3 MB with a clear message** (per file, and per message on send and draft create) instead of failing at Microsoft after the upload. Larger files need an upload session, which is not implemented.
+- **Reply-all no longer addresses yourself.** `email_reply` with `replyAll` leaves the account's own address out of To and Cc (whatever its case) and lists every other address once. When nobody else is left (a mail you sent only to yourself), the reply goes to the original sender.
+- **On IMAP and iCloud the `headers` of a message hold header values only.** A message returned by `email_get` used to carry the whole header line in each entry (`Message-ID: <id@host>`); it now carries the value (`<id@host>`), with folded lines joined. The old shape is also what made replies go out with a broken `In-Reply-To` (see "Fixed").
+- **Gmail messages expose `message-id`, `in-reply-to` and `references` in `headers`.** They used to have no `headers` at all.
+
+### Fixed
+- **Replies now stay in their thread on Gmail and Outlook.** A reply used to start a new conversation: Gmail needs the thread id on the API call, and Outlook only threads a reply made through Graph's `createReply`. `email_reply` now does both, and an Outlook reply keeps the subject the tool built ("Re: ..." once) instead of the one Graph pre-fills. Contributed by @jonboy648 (#21).
+- **Replies pointed at the wrong message id.** On Gmail the `In-Reply-To` header held Gmail's internal message id, and on iCloud and IMAP it held the whole header line (`<Message-ID: <id@host>`), so other mail programs could not thread the reply. Both now carry the original's Message-ID, and `References` continues the original's chain.
+- **Drafts keep their thread on update.** `email_draft_update` rebuilds the message on Gmail, iCloud and IMAP, which dropped a reply draft out of its thread. Gmail now carries the thread id and the reply headers of the stored draft over, iCloud and IMAP carry the `In-Reply-To` and `References` headers over. Outlook updates the draft in place and never lost it.
+- **A failed Outlook reply leaves no half-built draft behind.** When writing the fields or uploading an attachment fails after the reply draft was created, the draft is deleted again and the original error is returned; if the delete fails as well, the error says that the draft was left in Drafts. Attachments over 3 MB are refused before the draft is created. When the send itself fails the outcome is not known (the mail may be on its way), so the draft is kept and the error names it: check Sent Items before sending it again.
+- **iCloud and IMAP attachments are found by the id the message lists.** An attachment without a Content-ID is listed as `att-0`, `att-1` and so on, which `email_get_attachment` and `email_save_attachment` then did not find, and both always looked in INBOX. The listed id now always resolves, and `sourceFolder` reaches messages in other folders.
+
+## [1.9.0] - 2026-10-02
+
+Forwarding rules. A minor release: three new tools, and one existing tool lists less than before (see "Changed").
+
+### Added
+- **Forwarding rules: `email_create_forward_rule`, `email_list_forward_rules`, `email_delete_forward_rule`.** A standing rule that forwards future mail matching a sender, subject or header to another address, on Gmail (a filter) and Outlook (an inbox rule). Forwarding is off until you allow a target: the tool only accepts addresses listed in the new `EMAIL_MCP_FORWARD_ALLOWLIST` environment variable (comma-separated), which no tool can change, so an email that asks the assistant to forward mail somewhere cannot get its way. On Gmail the target must also be a confirmed forwarding address of the account; a missing or unconfirmed one is answered with the manual step. Creating the same rule twice returns the existing one, the original stays in the inbox unless `keepInInbox` is `false`, and the list includes forwarding rules made by hand in Gmail or Outlook. iCloud and generic IMAP say that they have no rule mechanism. No new scope: Gmail uses `gmail.settings.basic`, Outlook `MailboxSettings.ReadWrite`, both already requested for block rules.
+- **The setup wizard ends with a short note on how the project is funded.** After "Setup complete!" it prints three lines: email-mcp is free, Google requires a yearly independent security audit (675 US dollars) for the Gmail sign-in it ships, and a link to GitHub Sponsors. Printed once per wizard run, nothing else changes.
+
+### Changed
+- **`email_list_block_rules` no longer lists forwarding rules.** It used to show every Gmail filter and every Outlook inbox rule, so a forwarding rule appeared as a "moveToJunk" block rule. Those now appear in `email_list_forward_rules` only.
+
+## [1.8.1] - 2026-09-27
+
+Formatted emails survive. A patch release: bug fixes only, no tool or input changed.
+
+### Fixed
+- **Gmail dropped the HTML part of every outgoing message.** Send, reply, forward, draft create and draft update built the message as `text/plain` only, so a message with both a text and an HTML body lost its HTML (a draft opened in Gmail as "Plain text"), and an HTML-only message arrived showing its raw HTML source. Gmail now receives a proper MIME message: text only stays `text/plain`, HTML only becomes `multipart/alternative` with a readable text part derived from the HTML, and both parts are kept as `multipart/alternative` with text first and HTML second. Attachments passed to the Gmail provider are now included instead of discarded.
+- **IMAP and iCloud drafts lost their HTML and their Bcc recipients.** A draft with both parts was stored as text only, a draft with only HTML was stored with an empty body, and Bcc was never written to the draft. Drafts now use the same MIME builder as Gmail, so both parts, Bcc and attachments are stored.
+- **Umlauts, emoji and quotes in headers could break Gmail and IMAP messages.** Subjects and display names with non-ASCII characters were written as raw 8-bit text instead of being encoded, and a display name containing a double quote (for example `Anna "Ann" Schmidt`) broke the To line. Headers are now RFC 2047 encoded and display names are quoted and escaped correctly on Gmail, IMAP, iCloud and SMTP sends; Cc and Bcc display names are no longer dropped. Non-ASCII bodies are sent as UTF-8 with quoted-printable or base64 transfer encoding.
+- **SMTP sends (IMAP and iCloud accounts) with only an HTML body had no text part.** They now carry a text part derived from the HTML as well.
 
 ## [1.8.0] - 2026-09-18
 
@@ -254,6 +311,10 @@ Merged four community contributions (thank you [@EduardF1](https://github.com/Ed
 - AES-256-GCM encrypted credential storage
 - Sequential fallback for batch operations on providers without native batch support
 
+[1.10.1]: https://github.com/marlinjai/email-mcp/compare/v1.10.0...v1.10.1
+[1.10.0]: https://github.com/marlinjai/email-mcp/compare/v1.9.0...v1.10.0
+[1.9.0]: https://github.com/marlinjai/email-mcp/compare/v1.8.1...v1.9.0
+[1.8.1]: https://github.com/marlinjai/email-mcp/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/marlinjai/email-mcp/compare/v1.7.2...v1.8.0
 [1.2.3]: https://github.com/marlinjai/email-mcp/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/marlinjai/email-mcp/compare/v1.2.1...v1.2.2

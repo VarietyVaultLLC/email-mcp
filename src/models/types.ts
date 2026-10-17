@@ -49,15 +49,15 @@ export interface Email {
   body: { text?: string; html?: string };
   snippet?: string;
   attachments: AttachmentMeta[];
-  /** Provider flag: the message has attachments, even when `attachments` is
-   *  empty because search results do not fetch attachment metadata. */
+  /** Provider flag: the message has attachments even when `attachments` is
+   *  empty (search results do not fetch attachment metadata). */
   hasAttachments?: boolean;
+  /** Outlook Focused Inbox verdict, 'focused' or 'other'. Absent elsewhere. */
+  inferenceClassification?: string;
+  /** Link that opens the message in Outlook on the web. Absent elsewhere. */
+  webLink?: string;
   labels?: string[];
   categories?: string[];
-  /** Outlook Focused Inbox verdict ('focused' | 'other'); absent elsewhere. */
-  inferenceClassification?: string;
-  /** Link that opens the message in Outlook on the web (Outlook only). */
-  webLink?: string;
   flags: {
     read: boolean;
     starred: boolean;
@@ -171,6 +171,25 @@ export interface BlockRuleInput {
 }
 
 export interface BlockRule extends BlockRuleInput {
+  id: string;
+  createdAt: string;
+}
+
+/**
+ * A standing rule that forwards future mail matching a pattern to another
+ * address. Forwarding is the classic way mail leaves a mailbox unnoticed, so
+ * the tool layer only accepts targets the user listed in
+ * EMAIL_MCP_FORWARD_ALLOWLIST (see src/tools/forwarding.ts).
+ */
+export interface ForwardRuleInput {
+  matchType: 'senderDomain' | 'senderAddress' | 'subjectContains' | 'headerContains';
+  value: string;
+  forwardTo: string;
+  /** When false the original skips the inbox (archived). */
+  keepInInbox: boolean;
+}
+
+export interface ForwardRule extends ForwardRuleInput {
   id: string;
   createdAt: string;
 }

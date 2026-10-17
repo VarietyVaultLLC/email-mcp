@@ -11,6 +11,8 @@ import type {
   BatchResult,
   BlockRuleInput,
   BlockRule,
+  ForwardRuleInput,
+  ForwardRule,
 } from '../../models/types.js';
 import { ProviderType } from '../../models/types.js';
 import { mapGraphFolder, mapGraphMessage, mapGraphAttachment, buildGraphFilter, resolveWellKnownFolder } from './mapper.js';
@@ -21,6 +23,42 @@ const toGraphAttachment = (att: { filename: string; contentType: string; content
   contentType: att.contentType,
   contentBytes: att.content.toString('base64'),
 });
+
+// Graph takes a file attachment inline only below 3 MB, and a whole request
+// body only below 4 MB (base64 and JSON overhead included); anything larger
+// needs an upload session, which this adapter does not implement. Refusing
+// here gives a clear message instead of Graph's 413 after the upload.
+export const OUTLOOK_MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;
+export const OUTLOOK_MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+
+type OutgoingAttachments = NonNullable<SendEmailParams['attachments']>;
+
+const UPLOAD_SESSION_HINT = 'Larger files need an upload session, which email-mcp does not implement for Outlook yet.';
+
+function megabytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Each file on its own must fit Graph's inline attachment limit. */
+function assertOutlookAttachmentSizes(attachments: OutgoingAttachments | undefined): void {
+  if (!attachments?.length) return;
+  const limit = megabytes(OUTLOOK_MAX_ATTACHMENT_BYTES);
+  for (const att of attachments) {
+    if (att.content.length > OUTLOOK_MAX_ATTACHMENT_BYTES) {
+      throw new Error(`Outlook accepts attachments up to ${limit} through email-mcp; ${att.filename} is ${megabytes(att.content.length)}. ${UPLOAD_SESSION_HINT}`);
+    }
+  }
+}
+
+/** The whole serialized request (attachments base64-encoded, JSON overhead included) must fit Graph's write limit. */
+function assertOutlookRequestSize(body: unknown): void {
+  const bytes = Buffer.byteLength(JSON.stringify(body));
+  if (bytes > OUTLOOK_MAX_REQUEST_BYTES) {
+    throw new Error(
+      `Outlook accepts requests up to ${megabytes(OUTLOOK_MAX_REQUEST_BYTES)} through email-mcp; this message is ${megabytes(bytes)} once its attachments are base64-encoded. ${UPLOAD_SESSION_HINT}`,
+    );
+  }
+}
 
 export class OutlookAdapter implements EmailProvider {
   readonly providerType: ProviderTypeValue = ProviderType.Outlook;
@@ -150,7 +188,11 @@ export class OutlookAdapter implements EmailProvider {
       request = request.skip(query.offset);
     }
 
-    request = request.orderby('receivedDateTime desc');
+    // Graph rejects $orderby combined with $search (results then come back
+    // in relevance order).
+    if (!search) {
+      request = request.orderby('receivedDateTime desc');
+    }
 
     const response = await request.get();
     return (response.value || []).map((msg: any) => mapGraphMessage(msg, this.accountId));
@@ -218,42 +260,93 @@ export class OutlookAdapter implements EmailProvider {
    * Graph only threads a reply (conversationId, subject, quoted history)
    * through the createReply flow: POST /me/messages and /me/sendMail always
    * start a new conversation whatever In-Reply-To says. Build the reply draft,
-   * overlay our body, recipients and attachments, and return its id. Note the
-   * body replaces Graph's pre-filled quoted history.
+   * overlay our subject, body, recipients and attachments, and return its id.
+   * Note the body replaces Graph's pre-filled quoted history.
+   *
+   * Each attachment goes up in a request of its own, so the sizes are checked
+   * per file, and before createReply so that a file that is too big leaves no
+   * draft behind. A draft that cannot be filled is deleted again. (A draft
+   * whose send failed is kept, see `sendEmail`.)
    */
   private async createReplyDraft(params: SendEmailParams, replyToId: string): Promise<string> {
     const client = this.ensureClient();
+    assertOutlookAttachmentSizes(params.attachments);
     const draft = await client.api(`/me/messages/${encodeURIComponent(replyToId)}/createReply`).post({});
+    try {
+      await this.fillReplyDraft(draft.id, params);
+    } catch (error) {
+      throw await this.discardDraft(draft.id, error);
+    }
+    return draft.id;
+  }
+
+  private async fillReplyDraft(draftId: string, params: SendEmailParams): Promise<void> {
+    const client = this.ensureClient();
     const toGraphRecipient = (c: { name?: string; email: string }) => ({
       emailAddress: { name: c.name, address: c.email },
     });
     const patch: any = {
+      // Always the caller's subject: Graph pre-fills its own "RE: ..." one.
+      subject: params.subject,
       body: { contentType: params.body.html ? 'html' : 'text', content: params.body.html || params.body.text || '' },
     };
-    // Keep the recipients Graph pre-filled (the original sender) unless given.
+    // A reply needs someone in To, so an empty list keeps the recipient
+    // Graph pre-filled (the original sender), like no list does.
     if (params.to?.length) patch.toRecipients = params.to.map(toGraphRecipient);
-    if (params.cc?.length) patch.ccRecipients = params.cc.map(toGraphRecipient);
-    if (params.bcc?.length) patch.bccRecipients = params.bcc.map(toGraphRecipient);
-    await client.api(`/me/messages/${encodeURIComponent(draft.id)}`).patch(patch);
+    // Cc and Bcc: a given list replaces what Graph pre-filled, and an empty
+    // one clears it.
+    if (params.cc !== undefined) patch.ccRecipients = params.cc.map(toGraphRecipient);
+    if (params.bcc !== undefined) patch.bccRecipients = params.bcc.map(toGraphRecipient);
+    await client.api(`/me/messages/${encodeURIComponent(draftId)}`).patch(patch);
     for (const att of params.attachments ?? []) {
-      await client.api(`/me/messages/${encodeURIComponent(draft.id)}/attachments`).post(toGraphAttachment(att));
+      await client.api(`/me/messages/${encodeURIComponent(draftId)}/attachments`).post(toGraphAttachment(att));
     }
-    return draft.id;
+  }
+
+  /**
+   * Deletes a reply draft that could not be filled, so a failed reply leaves
+   * nothing half-built in Drafts. Returns the error to throw: the original
+   * one, or, when the delete fails as well, the original message with a note
+   * that the draft is still there.
+   */
+  private async discardDraft(draftId: string, cause: unknown): Promise<unknown> {
+    try {
+      await this.ensureClient().api(`/me/messages/${encodeURIComponent(draftId)}`).delete();
+      return cause;
+    } catch (deleteError: any) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      return new Error(
+        `${message} (the reply draft ${draftId} could not be removed and was left in Drafts: ${deleteError?.message ?? deleteError})`,
+        { cause },
+      );
+    }
   }
 
   async sendEmail(params: SendEmailParams): Promise<{ id: string; threadId?: string }> {
     const client = this.ensureClient();
     if (params.replyToGraphId) {
       const draftId = await this.createReplyDraft(params, params.replyToGraphId);
-      await client.api(`/me/messages/${encodeURIComponent(draftId)}/send`).post({});
+      try {
+        await client.api(`/me/messages/${encodeURIComponent(draftId)}/send`).post({});
+      } catch (error: any) {
+        // A failed send has no known outcome: after a timeout or a 5xx the
+        // mail can be on its way already, and a delete by this id could then
+        // remove the sent item. So the draft stays, and the error says where.
+        throw new Error(
+          `${error?.message ?? error} (the reply was saved as draft ${draftId} in Drafts and was not confirmed as sent; check Sent Items before sending it again)`,
+          { cause: error },
+        );
+      }
       return { id: draftId };
     }
+    assertOutlookAttachmentSizes(params.attachments);
     const message = this.buildGraphMessage(params);
 
     const payload: any = { message };
     if (params.attachments?.length) {
       payload.message.attachments = params.attachments.map(toGraphAttachment);
     }
+    assertOutlookRequestSize(payload);
 
     await client.api('/me/sendMail').post(payload);
 
@@ -265,10 +358,12 @@ export class OutlookAdapter implements EmailProvider {
     if (params.replyToGraphId) {
       return { id: await this.createReplyDraft(params, params.replyToGraphId) };
     }
+    assertOutlookAttachmentSizes(params.attachments);
     const message = this.buildGraphMessage(params);
     if (params.attachments?.length) {
       message.attachments = params.attachments.map(toGraphAttachment);
     }
+    assertOutlookRequestSize(message);
 
     const result = await client.api('/me/messages').post(message);
     return { id: result.id };
@@ -276,20 +371,35 @@ export class OutlookAdapter implements EmailProvider {
 
   async updateDraft(draftId: string, params: SendEmailParams): Promise<{ id: string }> {
     const client = this.ensureClient();
+    assertOutlookAttachmentSizes(params.attachments);
+    // PATCH changes fields of the stored message and leaves its conversation
+    // alone, so a reply draft stays in its thread without any thread data here.
     const message = this.buildGraphMessage(params);
 
     await client.api(`/me/messages/${encodeURIComponent(draftId)}`).patch(message);
 
-    // PATCH cannot change attachments, so replace them explicitly when new ones
-    // are given. Omitted attachments leave the draft's existing files in place.
-    if (params.attachments?.length) {
+    // PATCH cannot change attachments. `attachments` omitted leaves the
+    // draft's files alone; a list (an empty one included) replaces them.
+    if (params.attachments) {
       const attachmentsPath = `/me/messages/${encodeURIComponent(draftId)}/attachments`;
-      const existing = await client.api(attachmentsPath).select('id').get();
-      for (const att of existing.value || []) {
-        await client.api(`${attachmentsPath}/${encodeURIComponent(att.id)}`).delete();
+
+      // Every page of the files that are there now, before anything changes.
+      const previousIds: string[] = [];
+      let page = await client.api(attachmentsPath).select('id').get();
+      for (;;) {
+        previousIds.push(...(page.value || []).map((att: any) => att.id));
+        const next = page['@odata.nextLink'];
+        if (!next) break;
+        page = await client.api(next).get();
       }
+
+      // Add first, delete after: if an upload fails the draft still has its
+      // old files, plus whichever new ones made it, never none.
       for (const att of params.attachments) {
         await client.api(attachmentsPath).post(toGraphAttachment(att));
+      }
+      for (const id of previousIds) {
+        await client.api(`${attachmentsPath}/${encodeURIComponent(id)}`).delete();
       }
     }
     return { id: draftId };
@@ -547,28 +657,60 @@ export class OutlookAdapter implements EmailProvider {
    * before this scope was added need to re-run the setup wizard to
    * re-consent — old tokens will 403 on this call until then.
    */
-  async createBlockRule(rule: BlockRuleInput): Promise<{ id: string }> {
-    const client = this.ensureClient();
+  private ruleConditions(matchType: BlockRuleInput['matchType'], value: string): any {
     const conditions: any = {};
 
-    switch (rule.matchType) {
+    switch (matchType) {
       case 'senderDomain':
       case 'senderAddress':
         // Graph's senderContains does substring matching against the From
         // address, so a bare domain (e.g. "getdrip.com") already matches
         // any sender at that domain — no "@" prefix needed.
-        conditions.senderContains = [rule.value];
+        conditions.senderContains = [value];
         break;
       case 'subjectContains':
-        conditions.subjectContains = [rule.value];
+        conditions.subjectContains = [value];
         break;
       case 'headerContains':
         // Matches any header's raw content — the right predicate for a
         // stable element (e.g. a Reply-To domain) when the From domain
         // rotates across a spam template family.
-        conditions.headerContains = [rule.value];
+        conditions.headerContains = [value];
         break;
     }
+
+    return conditions;
+  }
+
+  // Graph doesn't tag which of our four matchTypes a rule came from:
+  // this reconstruction is a best-effort heuristic for listing/auditing,
+  // not a guaranteed round-trip of what was originally requested.
+  private readConditions(conditions: any): { matchType: BlockRuleInput['matchType']; value: string } {
+    if (conditions?.senderContains?.length) {
+      const value: string = conditions.senderContains[0];
+      return { matchType: value.includes('@') ? 'senderAddress' : 'senderDomain', value };
+    }
+    if (conditions?.subjectContains?.length) return { matchType: 'subjectContains', value: conditions.subjectContains[0] };
+    if (conditions?.headerContains?.length) return { matchType: 'headerContains', value: conditions.headerContains[0] };
+    return { matchType: 'headerContains', value: '' };
+  }
+
+  /** Addresses a rule sends mail on to, whether by "forward" or "redirect". */
+  private static forwardTargets(actions: any): string[] {
+    return [...(actions?.forwardTo || []), ...(actions?.redirectTo || []), ...(actions?.forwardAsAttachmentTo || [])]
+      .map((r: any) => r?.emailAddress?.address)
+      .filter((a: unknown): a is string => typeof a === 'string' && a.length > 0);
+  }
+
+  private async listMessageRules(): Promise<any[]> {
+    const client = this.ensureClient();
+    const response = await client.api('/me/mailFolders/inbox/messageRules').get();
+    return response.value || [];
+  }
+
+  async createBlockRule(rule: BlockRuleInput): Promise<{ id: string }> {
+    const client = this.ensureClient();
+    const conditions = this.ruleConditions(rule.matchType, rule.value);
 
     const actions: any = { stopProcessingRules: true };
     if (rule.action === 'delete') {
@@ -577,7 +719,7 @@ export class OutlookAdapter implements EmailProvider {
       actions.moveToFolder = await this.resolveFolder('junkemail');
     }
 
-    const existing = await this.listBlockRules();
+    const existing = await this.listMessageRules();
     const result = await client.api('/me/mailFolders/inbox/messageRules').post({
       displayName: `email-mcp: ${rule.matchType} "${rule.value}"`.slice(0, 255),
       sequence: existing.length + 1,
@@ -590,38 +732,78 @@ export class OutlookAdapter implements EmailProvider {
   }
 
   async listBlockRules(): Promise<BlockRule[]> {
-    const client = this.ensureClient();
-    const response = await client.api('/me/mailFolders/inbox/messageRules').get();
-    return (response.value || []).map((r: any): BlockRule => {
-      const conditions = r.conditions || {};
-      let matchType: BlockRuleInput['matchType'] = 'headerContains';
-      let value = '';
-      // Graph doesn't tag which of our four matchTypes a rule came from —
-      // this reconstruction is a best-effort heuristic for listing/auditing,
-      // not a guaranteed round-trip of what was originally requested.
-      if (conditions.senderContains?.length) {
-        value = conditions.senderContains[0];
-        matchType = value.includes('@') ? 'senderAddress' : 'senderDomain';
-      } else if (conditions.subjectContains?.length) {
-        matchType = 'subjectContains';
-        value = conditions.subjectContains[0];
-      } else if (conditions.headerContains?.length) {
-        matchType = 'headerContains';
-        value = conditions.headerContains[0];
-      }
-      return {
+    // A rule that forwards is a forward rule (listForwardRules), not a block rule.
+    return (await this.listMessageRules())
+      .filter((r: any) => OutlookAdapter.forwardTargets(r.actions).length === 0)
+      .map((r: any): BlockRule => ({
         id: r.id,
-        matchType,
-        value,
+        ...this.readConditions(r.conditions),
         action: r.actions?.delete ? 'delete' : 'moveToJunk',
         createdAt: '', // Graph's messageRule resource has no creation timestamp field
-      };
-    });
+      }));
   }
 
   async deleteBlockRule(ruleId: string): Promise<void> {
     const client = this.ensureClient();
     await client.api(`/me/mailFolders/inbox/messageRules/${encodeURIComponent(ruleId)}`).delete();
+  }
+
+  /**
+   * Outlook forwards to any address without a confirmation step, so the only
+   * check on the target is the allowlist in the tool layer. Needs the same
+   * MailboxSettings.ReadWrite scope as block rules.
+   */
+  async createForwardRule(rule: ForwardRuleInput): Promise<{ id: string; alreadyExisted?: boolean }> {
+    const client = this.ensureClient();
+    const forwardTo = rule.forwardTo.trim();
+    const target = forwardTo.toLowerCase();
+
+    const all = await this.listMessageRules();
+    const existing = all.find((r: any) => {
+      const read = this.readConditions(r.conditions);
+      // senderDomain and senderAddress are the same Graph condition, so compare the value only.
+      const sameMatch = read.value.toLowerCase() === rule.value.toLowerCase()
+        && (read.matchType === rule.matchType || (read.matchType.startsWith('sender') && rule.matchType.startsWith('sender')));
+      return sameMatch && OutlookAdapter.forwardTargets(r.actions).some((a) => a.toLowerCase() === target);
+    });
+    if (existing) return { id: existing.id, alreadyExisted: true };
+
+    const actions: any = { forwardTo: [{ emailAddress: { address: forwardTo } }] };
+    if (!rule.keepInInbox) {
+      actions.moveToFolder = await this.resolveFolder('archive');
+      actions.stopProcessingRules = true;
+    }
+
+    const result = await client.api('/me/mailFolders/inbox/messageRules').post({
+      displayName: `email-mcp: forward ${rule.matchType} "${rule.value}" to ${forwardTo}`.slice(0, 255),
+      sequence: all.length + 1,
+      isEnabled: true,
+      conditions: this.ruleConditions(rule.matchType, rule.value),
+      actions,
+    });
+
+    return { id: result.id };
+  }
+
+  /** Every inbox rule that forwards or redirects, including ones made by hand in Outlook. */
+  async listForwardRules(): Promise<ForwardRule[]> {
+    return (await this.listMessageRules())
+      .filter((r: any) => OutlookAdapter.forwardTargets(r.actions).length > 0)
+      .map((r: any): ForwardRule => ({
+        id: r.id,
+        ...this.readConditions(r.conditions),
+        forwardTo: OutlookAdapter.forwardTargets(r.actions).join(', '),
+        keepInInbox: !r.actions?.moveToFolder && !r.actions?.delete,
+        createdAt: '', // Graph's messageRule resource has no creation timestamp field
+      }));
+  }
+
+  async deleteForwardRule(ruleId: string): Promise<void> {
+    const rules = await this.listForwardRules();
+    if (!rules.some((r) => r.id === ruleId)) {
+      throw new Error(`No forwarding rule with id ${ruleId} on this account. Use email_list_forward_rules to see the ids.`);
+    }
+    await this.deleteBlockRule(ruleId);
   }
 
   async getCategories(): Promise<string[]> {

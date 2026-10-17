@@ -5,7 +5,9 @@ import { registerAccountTools } from './tools/accounts.js';
 import { registerReadingTools } from './tools/reading.js';
 import { registerSendingTools } from './tools/sending.js';
 import { registerOrganizingTools } from './tools/organizing.js';
+import { registerCalendarTools } from './tools/calendar.js';
 import { registerModerationTools } from './tools/moderation.js';
+import { registerForwardingTools } from './tools/forwarding.js';
 
 /**
  * The version reported to MCP clients in the initialize handshake. Kept equal
@@ -13,7 +15,7 @@ import { registerModerationTools } from './tools/moderation.js';
  * together. (A runtime read of package.json is not used because esbuild
  * bundles entry points at different depths under dist/.)
  */
-export const SERVER_VERSION = '1.8.0';
+export const SERVER_VERSION = '1.10.1';
 
 export interface ServerResult {
   server: McpServer;
@@ -33,7 +35,9 @@ export async function createServer(accountManager?: AccountManager): Promise<Ser
   registerReadingTools(server, mgr);
   registerSendingTools(server, mgr);
   registerOrganizingTools(server, mgr);
+  registerCalendarTools(server, mgr);
   registerModerationTools(server, mgr);
+  registerForwardingTools(server, mgr);
 
   return { server, accountManager: mgr };
 }

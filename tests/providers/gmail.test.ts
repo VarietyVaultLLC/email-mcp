@@ -113,6 +113,7 @@ const mockDraftsGet = vi.fn();
 const mockFiltersCreate = vi.fn();
 const mockFiltersList = vi.fn();
 const mockFiltersDelete = vi.fn();
+const mockForwardingAddressesList = vi.fn();
 
 // Mock googleapis
 vi.mock('googleapis', () => ({
@@ -135,6 +136,7 @@ vi.mock('googleapis', () => ({
         drafts: { create: mockDraftsCreate, update: mockDraftsUpdate, list: mockDraftsList, get: mockDraftsGet },
         settings: {
           filters: { create: mockFiltersCreate, list: mockFiltersList, delete: mockFiltersDelete },
+          forwardingAddresses: { list: mockForwardingAddressesList },
         },
       },
     }),
@@ -152,6 +154,7 @@ vi.mock('google-auth-library', () => {
   return { OAuth2Client: MockOAuth2Client };
 });
 
+import { simpleParser } from 'mailparser';
 import { GmailAdapter } from '../../src/providers/gmail/adapter.js';
 import { ProviderType } from '../../src/models/types.js';
 import type { AccountCredentials } from '../../src/models/types.js';
@@ -197,6 +200,9 @@ function resetMocks() {
   mockFiltersCreate.mockResolvedValue({ data: { id: 'filter-1' } });
   mockFiltersList.mockResolvedValue({ data: { filter: [] } });
   mockFiltersDelete.mockResolvedValue({ data: {} });
+  mockForwardingAddressesList.mockResolvedValue({
+    data: { forwardingAddresses: [{ forwardingEmail: 'expenses@example.com', verificationStatus: 'accepted' }] },
+  });
 }
 
 describe('GmailAdapter', () => {
@@ -481,6 +487,33 @@ describe('GmailAdapter', () => {
       });
     });
 
+    it('exposes the threading headers a reply is built from', async () => {
+      mockMessagesGet.mockResolvedValueOnce({
+        data: {
+          ...mockMessageMetadata,
+          payload: {
+            ...mockMessageMetadata.payload,
+            headers: [
+              ...mockMessageMetadata.payload.headers,
+              { name: 'In-Reply-To', value: '<parent@example.com>' },
+              { name: 'References', value: '<root@example.com> <parent@example.com>' },
+            ],
+          },
+        },
+      });
+      const email = await adapter.getEmail('msg-123');
+      expect(email.headers).toEqual({
+        'message-id': '<msg-123@example.com>',
+        'in-reply-to': '<parent@example.com>',
+        references: '<root@example.com> <parent@example.com>',
+      });
+    });
+
+    it('has no headers map when the message carries none of them', async () => {
+      mockMessagesGet.mockResolvedValueOnce({ data: mockMessageWithAttachment });
+      expect((await adapter.getEmail('msg-att-1')).headers).toBeUndefined();
+    });
+
     it('maps attachments', async () => {
       mockMessagesGet.mockResolvedValueOnce({
         data: mockMessageWithAttachment,
@@ -505,13 +538,34 @@ describe('GmailAdapter', () => {
   });
 
   describe('sendEmail', () => {
-    it('joins the Gmail thread when threadId is given', async () => {
-      await adapter.sendEmail({
-        to: [{ email: 'bob@example.com' }], subject: 'Re: x', body: { text: 'y' }, threadId: 'thread-9',
-      });
-      expect(mockMessagesSend).toHaveBeenCalledWith(
-        expect.objectContaining({ requestBody: expect.objectContaining({ threadId: 'thread-9' }) }),
-      );
+    const reply = {
+      to: [{ email: 'bob@example.com' }], subject: 'Re: x', body: { text: 'y' },
+      threadId: 'thread-9', inReplyTo: '<orig@example.com>', references: ['<orig@example.com>'],
+    };
+
+    it('joins the Gmail thread when threadId comes with the reply headers and a subject', async () => {
+      await adapter.sendEmail(reply);
+      const body = mockMessagesSend.mock.calls[0][0].requestBody;
+      expect(body.threadId).toBe('thread-9');
+      const parsed = await simpleParser(Buffer.from(body.raw, 'base64url'));
+      expect(parsed.inReplyTo).toBe('<orig@example.com>');
+      expect(parsed.references).toBe('<orig@example.com>');
+      expect(parsed.subject).toBe('Re: x');
+    });
+
+    it.each([
+      ['In-Reply-To', { ...reply, inReplyTo: undefined }],
+      ['References', { ...reply, references: undefined }],
+      ['References (empty list)', { ...reply, references: [] }],
+      ['a subject', { ...reply, subject: ' ' }],
+    ])('sends without threadId when %s is missing', async (_what, params) => {
+      await adapter.sendEmail(params);
+      expect(mockMessagesSend.mock.calls[0][0].requestBody).toEqual({ raw: expect.any(String) });
+    });
+
+    it('a plain send carries no threadId', async () => {
+      await adapter.sendEmail({ to: [{ email: 'bob@example.com' }], subject: 'New', body: { text: 'y' } });
+      expect(mockMessagesSend.mock.calls[0][0].requestBody).toEqual({ raw: expect.any(String) });
     });
 
     it('sends email via Gmail API', async () => {
@@ -533,11 +587,19 @@ describe('GmailAdapter', () => {
   });
 
   describe('createDraft', () => {
-    it('puts a reply draft in the Gmail thread when threadId is given', async () => {
+    it('puts a reply draft in the Gmail thread when threadId comes with the reply headers', async () => {
+      await adapter.createDraft({
+        to: [{ email: 'bob@example.com' }], subject: 'Re: x', body: { text: 'y' },
+        threadId: 'thread-9', inReplyTo: '<orig@example.com>', references: ['<orig@example.com>'],
+      });
+      expect(mockDraftsCreate.mock.calls.at(-1)![0].requestBody.message.threadId).toBe('thread-9');
+    });
+
+    it('creates the draft without threadId when the reply headers are missing', async () => {
       await adapter.createDraft({
         to: [{ email: 'bob@example.com' }], subject: 'Re: x', body: { text: 'y' }, threadId: 'thread-9',
       });
-      expect(mockDraftsCreate.mock.calls.at(-1)![0].requestBody.message.threadId).toBe('thread-9');
+      expect(mockDraftsCreate.mock.calls.at(-1)![0].requestBody.message).toEqual({ raw: expect.any(String) });
     });
 
     it('creates draft via Gmail API', async () => {
@@ -586,6 +648,293 @@ describe('GmailAdapter', () => {
           requestBody: expect.objectContaining({ message: { raw: expect.any(String) } }),
         }),
       );
+    });
+
+    const update = { to: [{ email: 'bob@example.com' }], subject: 'Re: Test Email', body: { text: 'Second version' } };
+    const storedReplyDraft = (headers: Array<{ name: string; value: string }>) => ({
+      data: { id: 'draft-1', message: { id: 'msg-draft-1', threadId: 'thread-456', payload: { headers } } },
+    });
+
+    it('keeps a reply draft in its thread: threadId and reply headers are carried over', async () => {
+      mockDraftsGet.mockResolvedValueOnce(storedReplyDraft([
+        { name: 'Subject', value: 'Re: Test Email' },
+        { name: 'In-Reply-To', value: '<msg-123@example.com>' },
+        { name: 'References', value: '<root@example.com>\r\n <msg-123@example.com>' },
+      ]));
+
+      await adapter.updateDraft('draft-1', update);
+
+      // The files are not named either, so the whole stored draft is read.
+      expect(mockDraftsGet).toHaveBeenCalledWith({ userId: 'me', id: 'draft-1', format: 'full' });
+      const message = mockDraftsUpdate.mock.calls[0][0].requestBody.message;
+      expect(message.threadId).toBe('thread-456');
+      const parsed = await simpleParser(Buffer.from(message.raw, 'base64url'));
+      expect(parsed.inReplyTo).toBe('<msg-123@example.com>');
+      expect(parsed.references).toEqual(['<root@example.com>', '<msg-123@example.com>']);
+      expect(parsed.text?.trim()).toBe('Second version');
+    });
+
+    it('reads only the headers of the stored draft when the caller names the files', async () => {
+      mockDraftsGet.mockResolvedValueOnce(storedReplyDraft([{ name: 'In-Reply-To', value: '<msg-123@example.com>' }]));
+
+      await adapter.updateDraft('draft-1', { ...update, attachments: [] });
+
+      expect(mockDraftsGet).toHaveBeenCalledWith({ userId: 'me', id: 'draft-1', format: 'metadata' });
+      expect(mockAttachmentsGet).not.toHaveBeenCalled();
+    });
+
+    it('carries over a reply draft that has In-Reply-To but no References', async () => {
+      mockDraftsGet.mockResolvedValueOnce(storedReplyDraft([{ name: 'in-reply-to', value: '<msg-123@example.com>' }]));
+
+      await adapter.updateDraft('draft-1', update);
+
+      const message = mockDraftsUpdate.mock.calls[0][0].requestBody.message;
+      expect(message.threadId).toBe('thread-456');
+      const parsed = await simpleParser(Buffer.from(message.raw, 'base64url'));
+      expect(parsed.references).toBe('<msg-123@example.com>');
+    });
+
+    it('a draft that is not a reply gets no threadId (its stored thread is its own)', async () => {
+      mockDraftsGet.mockResolvedValueOnce(storedReplyDraft([{ name: 'Subject', value: 'New' }]));
+
+      await adapter.updateDraft('draft-1', update);
+
+      expect(mockDraftsUpdate.mock.calls[0][0].requestBody.message).toEqual({ raw: expect.any(String) });
+    });
+
+    it('a stored draft without a message leaves the update unthreaded', async () => {
+      mockDraftsGet.mockResolvedValueOnce({ data: { id: 'draft-1' } });
+
+      await adapter.updateDraft('draft-1', update);
+
+      expect(mockDraftsUpdate.mock.calls[0][0].requestBody.message).toEqual({ raw: expect.any(String) });
+    });
+
+    it('does not read the stored draft when the caller names both the thread and the files', async () => {
+      await adapter.updateDraft('draft-1', {
+        ...update, threadId: 'thread-9', inReplyTo: '<orig@example.com>', references: ['<orig@example.com>'], attachments: [],
+      });
+
+      expect(mockDraftsGet).not.toHaveBeenCalled();
+      expect(mockDraftsUpdate.mock.calls[0][0].requestBody.message.threadId).toBe('thread-9');
+    });
+
+    describe('keeps the draft\'s files', () => {
+      const pdf = Buffer.from('%PDF-1.4 invoice');
+      const note = Buffer.from('small note');
+      const storedDraftWithFiles = {
+        data: {
+          id: 'draft-1',
+          message: {
+            id: 'msg-draft-1',
+            threadId: 'thread-own',
+            payload: {
+              mimeType: 'multipart/mixed',
+              headers: [{ name: 'Subject', value: 'Invoice' }],
+              parts: [
+                {
+                  mimeType: 'multipart/related',
+                  parts: [
+                    { mimeType: 'text/html', body: { data: Buffer.from('<p>Old <img src="cid:logo@local"></p>').toString('base64url') } },
+                    {
+                      mimeType: 'image/png',
+                      filename: 'logo.png',
+                      headers: [
+                        { name: 'Content-Disposition', value: 'inline; filename="logo.png"' },
+                        { name: 'Content-ID', value: '<logo@local>' },
+                      ],
+                      body: { attachmentId: 'att-logo' },
+                    },
+                  ],
+                },
+                {
+                  mimeType: 'image/png',
+                  filename: 'scan.png',
+                  headers: [
+                    { name: 'Content-Disposition', value: 'inline; filename="scan.png"' },
+                    { name: 'Content-ID', value: '<scan@local>' },
+                  ],
+                  body: { data: Buffer.from('scan').toString('base64url') },
+                },
+                { mimeType: 'application/pdf', filename: 'Invoice 59.pdf', body: { attachmentId: 'att-pdf', size: pdf.length } },
+                { mimeType: 'text/plain', filename: 'note.txt', body: { data: note.toString('base64url') } },
+              ],
+            },
+          },
+        },
+      };
+
+      const attachmentsOf = async () => {
+        const raw = mockDraftsUpdate.mock.calls[0][0].requestBody.message.raw;
+        const parsed = await simpleParser(Buffer.from(raw, 'base64url'));
+        return parsed.attachments.map((a) => ({ filename: a.filename, type: a.contentType, text: a.content.toString() }));
+      };
+
+      it('carries the stored files over when the update names none', async () => {
+        mockDraftsGet.mockResolvedValueOnce(storedDraftWithFiles);
+        mockAttachmentsGet.mockResolvedValueOnce({ data: { data: pdf.toString('base64url'), size: pdf.length } });
+
+        await adapter.updateDraft('draft-1', update);
+
+        // The large file is fetched by its id from the draft's message; the
+        // small one came inline; the image the old body embeds is left out, an
+        // inline part it does not reference is a file and stays.
+        expect(mockAttachmentsGet).toHaveBeenCalledTimes(1);
+        expect(mockAttachmentsGet).toHaveBeenCalledWith({ userId: 'me', messageId: 'msg-draft-1', id: 'att-pdf' });
+        expect(await attachmentsOf()).toEqual([
+          { filename: 'scan.png', type: 'image/png', text: 'scan' },
+          { filename: 'Invoice 59.pdf', type: 'application/pdf', text: '%PDF-1.4 invoice' },
+          { filename: 'note.txt', type: 'text/plain', text: 'small note' },
+        ]);
+      });
+
+      it('replaces the stored files when the update names its own', async () => {
+        await adapter.updateDraft('draft-1', {
+          ...update,
+          threadId: 'thread-9', inReplyTo: '<orig@example.com>', references: ['<orig@example.com>'],
+          attachments: [{ filename: 'new.txt', content: Buffer.from('new'), contentType: 'text/plain' }],
+        });
+
+        expect(mockAttachmentsGet).not.toHaveBeenCalled();
+        expect(await attachmentsOf()).toEqual([{ filename: 'new.txt', type: 'text/plain', text: 'new' }]);
+      });
+
+      it('removes the stored files when the update gives an empty list', async () => {
+        mockDraftsGet.mockResolvedValueOnce(storedDraftWithFiles);
+
+        await adapter.updateDraft('draft-1', { ...update, attachments: [] });
+
+        expect(mockAttachmentsGet).not.toHaveBeenCalled();
+        expect(await attachmentsOf()).toEqual([]);
+      });
+
+      it('keeps the files and the thread of a reply draft together', async () => {
+        mockDraftsGet.mockResolvedValueOnce({
+          data: {
+            ...storedDraftWithFiles.data,
+            message: {
+              ...storedDraftWithFiles.data.message,
+              threadId: 'thread-456',
+              payload: {
+                ...storedDraftWithFiles.data.message.payload,
+                headers: [{ name: 'In-Reply-To', value: '<msg-123@example.com>' }],
+              },
+            },
+          },
+        });
+        mockAttachmentsGet.mockResolvedValueOnce({ data: { data: pdf.toString('base64url'), size: pdf.length } });
+
+        await adapter.updateDraft('draft-1', update);
+
+        expect(mockDraftsUpdate.mock.calls[0][0].requestBody.message.threadId).toBe('thread-456');
+        expect((await attachmentsOf()).map((a) => a.filename)).toEqual(['scan.png', 'Invoice 59.pdf', 'note.txt']);
+      });
+
+      it('does not change the draft when one of its files cannot be fetched', async () => {
+        mockDraftsGet.mockResolvedValueOnce(storedDraftWithFiles);
+        mockAttachmentsGet.mockRejectedValueOnce(new Error('backend error'));
+
+        await expect(adapter.updateDraft('draft-1', update)).rejects.toThrow('backend error');
+        expect(mockDraftsUpdate).not.toHaveBeenCalled();
+      });
+
+      it('does not change the draft when a file comes back without content', async () => {
+        mockDraftsGet.mockResolvedValueOnce(storedDraftWithFiles);
+        mockAttachmentsGet.mockResolvedValueOnce({ data: {} });
+
+        await expect(adapter.updateDraft('draft-1', update)).rejects.toThrow(/Could not read the draft's attachment Invoice 59\.pdf/);
+        expect(mockDraftsUpdate).not.toHaveBeenCalled();
+      });
+
+      it('leaves a draft without files as it is', async () => {
+        await adapter.updateDraft('draft-1', update);
+
+        expect(mockAttachmentsGet).not.toHaveBeenCalled();
+        expect(await attachmentsOf()).toEqual([]);
+      });
+    });
+
+    it('fails without changing the draft when the stored draft cannot be read', async () => {
+      mockDraftsGet.mockRejectedValueOnce(new Error('Requested entity was not found.'));
+
+      await expect(adapter.updateDraft('gone', update)).rejects.toThrow('Requested entity was not found.');
+      expect(mockDraftsUpdate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('MIME built for send and drafts', () => {
+    const rich = {
+      to: [{ name: 'Müller, Hans', email: 'hans@example.com' }],
+      bcc: [{ email: 'hidden@example.com' }],
+      subject: 'Grüße 🎉',
+      body: { text: 'Plain part', html: '<p>HTML <b>part</b></p>' },
+      inReplyTo: '<orig@example.com>',
+      references: ['<orig@example.com>'],
+    };
+
+    async function parseRaw(raw: string) {
+      return simpleParser(Buffer.from(raw, 'base64url'));
+    }
+
+    async function expectRichMessage(raw: string) {
+      const parsed = await parseRaw(raw);
+      expect(parsed.text?.trim()).toBe('Plain part');
+      expect(parsed.html).toContain('<p>HTML <b>part</b></p>');
+      expect(parsed.subject).toBe('Grüße 🎉');
+      const to = Array.isArray(parsed.to) ? parsed.to[0] : parsed.to;
+      expect(to?.value).toEqual([{ name: 'Müller, Hans', address: 'hans@example.com' }]);
+      // Gmail reads Bcc recipients from the raw header, so it must survive.
+      const bcc = Array.isArray(parsed.bcc) ? parsed.bcc[0] : parsed.bcc;
+      expect(bcc?.value[0].address).toBe('hidden@example.com');
+      expect(parsed.inReplyTo).toBe('<orig@example.com>');
+      expect(parsed.from?.value[0].address).toBe(testCredentials.email);
+    }
+
+    it('sendEmail keeps both the text and the html part', async () => {
+      await adapter.sendEmail(rich);
+      await expectRichMessage(mockMessagesSend.mock.calls[0][0].requestBody.raw);
+    });
+
+    it('createDraft keeps both the text and the html part', async () => {
+      await adapter.createDraft(rich);
+      await expectRichMessage(mockDraftsCreate.mock.calls[0][0].requestBody.message.raw);
+    });
+
+    it('updateDraft keeps both the text and the html part', async () => {
+      await adapter.updateDraft('draft-1', rich);
+      await expectRichMessage(mockDraftsUpdate.mock.calls[0][0].requestBody.message.raw);
+    });
+
+    it('html-only input is sent as html with a derived text part, not as raw markup', async () => {
+      await adapter.createDraft({
+        to: [{ email: 'bob@example.com' }],
+        subject: 'HTML only',
+        body: { html: '<p>Hello <i>Bob</i></p>' },
+      });
+      const parsed = await parseRaw(mockDraftsCreate.mock.calls[0][0].requestBody.message.raw);
+      expect(parsed.html).toContain('<p>Hello <i>Bob</i></p>');
+      expect(parsed.text?.trim()).toBe('Hello Bob');
+    });
+
+    it('text-only input stays a plain text message', async () => {
+      await adapter.sendEmail({ to: [{ email: 'bob@example.com' }], subject: 'Plain', body: { text: 'Just text' } });
+      const parsed = await parseRaw(mockMessagesSend.mock.calls[0][0].requestBody.raw);
+      expect(parsed.text?.trim()).toBe('Just text');
+      expect(parsed.html).toBe(false);
+      expect(parsed.headers.get('content-type')).toMatchObject({ value: 'text/plain' });
+    });
+
+    it('sendEmail carries attachments', async () => {
+      await adapter.sendEmail({
+        to: [{ email: 'bob@example.com' }],
+        subject: 'Invoice',
+        body: { text: 'Attached' },
+        attachments: [{ filename: 'invoice.pdf', content: Buffer.from('pdf-bytes'), contentType: 'application/pdf' }],
+      });
+      const parsed = await parseRaw(mockMessagesSend.mock.calls[0][0].requestBody.raw);
+      expect(parsed.attachments).toHaveLength(1);
+      expect(parsed.attachments[0].filename).toBe('invoice.pdf');
+      expect(parsed.attachments[0].content.toString()).toBe('pdf-bytes');
     });
   });
 
@@ -776,12 +1125,150 @@ describe('GmailAdapter', () => {
         { id: 'f2', matchType: 'subjectContains', value: 'prize', action: 'moveToJunk', createdAt: '' },
       ]);
     });
+
+    it('leaves forwarding filters out: they are forward rules, not block rules', async () => {
+      mockFiltersList.mockResolvedValue({
+        data: {
+          filter: [
+            { id: 'f1', criteria: { from: '@bad.com' }, action: { addLabelIds: ['TRASH'] } },
+            { id: 'f2', criteria: { from: '@vendor.com' }, action: { forward: 'expenses@example.com' } },
+          ],
+        },
+      });
+
+      const rules = await adapter.listBlockRules();
+      expect(rules.map((r) => r.id)).toEqual(['f1']);
+    });
   });
 
   describe('deleteBlockRule', () => {
     it('calls filters.delete with the rule id', async () => {
       await adapter.deleteBlockRule('filter-1');
       expect(mockFiltersDelete).toHaveBeenCalledWith({ userId: 'me', id: 'filter-1' });
+    });
+  });
+
+  describe('createForwardRule', () => {
+    const rule = { matchType: 'senderDomain' as const, value: 'vendor.com', forwardTo: 'expenses@example.com', keepInInbox: true };
+
+    it('creates a forwarding filter that leaves the original in the inbox', async () => {
+      const result = await adapter.createForwardRule(rule);
+
+      expect(mockFiltersCreate).toHaveBeenCalledWith({
+        userId: 'me',
+        requestBody: { criteria: { from: '@vendor.com' }, action: { forward: 'expenses@example.com' } },
+      });
+      expect(result).toEqual({ id: 'filter-1' });
+    });
+
+    it('also skips the inbox when keepInInbox is false', async () => {
+      await adapter.createForwardRule({ ...rule, keepInInbox: false });
+      expect(mockFiltersCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestBody: expect.objectContaining({ action: { forward: 'expenses@example.com', removeLabelIds: ['INBOX'] } }),
+        }),
+      );
+    });
+
+    it('maps the other match types like block rules do', async () => {
+      await adapter.createForwardRule({ ...rule, matchType: 'subjectContains', value: 'Invoice' });
+      expect(mockFiltersCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ requestBody: expect.objectContaining({ criteria: { subject: 'Invoice' } }) }),
+      );
+    });
+
+    it('finds the forwarding address without regard to case', async () => {
+      await adapter.createForwardRule({ ...rule, forwardTo: 'Expenses@Example.com' });
+      expect(mockFiltersCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ requestBody: expect.objectContaining({ action: { forward: 'expenses@example.com' } }) }),
+      );
+    });
+
+    it('explains the manual step when the address was never added in Gmail', async () => {
+      mockForwardingAddressesList.mockResolvedValue({ data: {} });
+      await expect(adapter.createForwardRule(rule)).rejects.toThrow(/not a forwarding address of this Gmail account yet/);
+      expect(mockFiltersCreate).not.toHaveBeenCalled();
+    });
+
+    it('explains the confirmation step when the address is still pending', async () => {
+      mockForwardingAddressesList.mockResolvedValue({
+        data: { forwardingAddresses: [{ forwardingEmail: 'expenses@example.com', verificationStatus: 'pending' }] },
+      });
+      await expect(adapter.createForwardRule(rule)).rejects.toThrow(/not confirmed yet/);
+      expect(mockFiltersCreate).not.toHaveBeenCalled();
+    });
+
+    it('returns the existing filter when the same rule is already there', async () => {
+      mockFiltersList.mockResolvedValue({
+        data: { filter: [{ id: 'f7', criteria: { from: '@vendor.com' }, action: { forward: 'expenses@example.com' } }] },
+      });
+      const result = await adapter.createForwardRule(rule);
+      expect(result).toEqual({ id: 'f7', alreadyExisted: true });
+      expect(mockFiltersCreate).not.toHaveBeenCalled();
+    });
+
+    it('creates a new filter when the match is the same but the target differs', async () => {
+      mockForwardingAddressesList.mockResolvedValue({
+        data: {
+          forwardingAddresses: [
+            { forwardingEmail: 'expenses@example.com', verificationStatus: 'accepted' },
+            { forwardingEmail: 'books@example.com', verificationStatus: 'accepted' },
+          ],
+        },
+      });
+      mockFiltersList.mockResolvedValue({
+        data: { filter: [{ id: 'f7', criteria: { from: '@vendor.com' }, action: { forward: 'books@example.com' } }] },
+      });
+      const result = await adapter.createForwardRule(rule);
+      expect(result).toEqual({ id: 'filter-1' });
+    });
+  });
+
+  describe('listForwardRules', () => {
+    it('returns only filters that forward, with target and inbox behaviour', async () => {
+      mockFiltersList.mockResolvedValue({
+        data: {
+          filter: [
+            { id: 'f1', criteria: { from: '@bad.com' }, action: { addLabelIds: ['TRASH'] } },
+            { id: 'f2', criteria: { from: '@vendor.com' }, action: { forward: 'expenses@example.com' } },
+            { id: 'f3', criteria: { subject: 'Invoice' }, action: { forward: 'books@example.com', removeLabelIds: ['INBOX'] } },
+          ],
+        },
+      });
+
+      expect(await adapter.listForwardRules()).toEqual([
+        { id: 'f2', matchType: 'senderDomain', value: 'vendor.com', forwardTo: 'expenses@example.com', keepInInbox: true, createdAt: '' },
+        { id: 'f3', matchType: 'subjectContains', value: 'Invoice', forwardTo: 'books@example.com', keepInInbox: false, createdAt: '' },
+      ]);
+    });
+
+    it('is empty for an account without filters', async () => {
+      mockFiltersList.mockResolvedValue({ data: {} });
+      expect(await adapter.listForwardRules()).toEqual([]);
+    });
+  });
+
+  describe('deleteForwardRule', () => {
+    beforeEach(() => {
+      mockFiltersList.mockResolvedValue({
+        data: {
+          filter: [
+            { id: 'f1', criteria: { from: '@bad.com' }, action: { addLabelIds: ['TRASH'] } },
+            { id: 'f2', criteria: { from: '@vendor.com' }, action: { forward: 'expenses@example.com' } },
+          ],
+        },
+      });
+    });
+
+    it('deletes a forwarding filter by id', async () => {
+      await adapter.deleteForwardRule('f2');
+      expect(mockFiltersDelete).toHaveBeenCalledWith({ userId: 'me', id: 'f2' });
+    });
+
+    it('refuses an id that is not a forwarding filter, so a block rule is not removed by mistake', async () => {
+      await expect(adapter.deleteForwardRule('f1')).rejects.toThrow(/No forwarding rule with id f1/);
+      await expect(adapter.deleteForwardRule('nope')).rejects.toThrow(/No forwarding rule with id nope/);
+      expect(mockFiltersDelete).not.toHaveBeenCalled();
     });
   });
 });
