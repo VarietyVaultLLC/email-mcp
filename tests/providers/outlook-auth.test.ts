@@ -51,6 +51,7 @@ describe('OutlookAuth', () => {
           codeChallenge: 'test-challenge-67890',
           codeChallengeMethod: 'S256',
           state: result.state,
+          prompt: 'select_account',
         })
       );
     });
@@ -135,9 +136,9 @@ describe('OutlookAuth', () => {
   });
 
   describe('authority', () => {
-    it('uses consumers authority for personal accounts', () => {
+    it('uses the common authority, for personal and work or school accounts', () => {
       expect(OutlookAuth.AUTHORITY).toBe(
-        'https://login.microsoftonline.com/consumers'
+        'https://login.microsoftonline.com/common'
       );
     });
   });

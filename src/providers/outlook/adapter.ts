@@ -172,7 +172,7 @@ export class OutlookAdapter implements EmailProvider {
 
     // When body is not needed, use $select to exclude it — dramatically reduces payload
     if (!query.returnBody) {
-      request = request.select('id,conversationId,parentFolderId,from,toRecipients,ccRecipients,bccRecipients,subject,receivedDateTime,bodyPreview,hasAttachments,isRead,importance,flag,isDraft,categories');
+      request = request.select('id,conversationId,parentFolderId,from,toRecipients,ccRecipients,bccRecipients,subject,receivedDateTime,bodyPreview,hasAttachments,isRead,importance,flag,isDraft,categories,inferenceClassification,webLink');
     }
 
     if (filter) {
@@ -188,7 +188,11 @@ export class OutlookAdapter implements EmailProvider {
       request = request.skip(query.offset);
     }
 
-    request = request.orderby('receivedDateTime desc');
+    // Graph rejects $orderby combined with $search (results then come back
+    // in relevance order).
+    if (!search) {
+      request = request.orderby('receivedDateTime desc');
+    }
 
     const response = await request.get();
     return (response.value || []).map((msg: any) => mapGraphMessage(msg, this.accountId));

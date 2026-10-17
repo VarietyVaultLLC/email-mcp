@@ -49,6 +49,13 @@ export interface Email {
   body: { text?: string; html?: string };
   snippet?: string;
   attachments: AttachmentMeta[];
+  /** Provider flag: the message has attachments even when `attachments` is
+   *  empty (search results do not fetch attachment metadata). */
+  hasAttachments?: boolean;
+  /** Outlook Focused Inbox verdict, 'focused' or 'other'. Absent elsewhere. */
+  inferenceClassification?: string;
+  /** Link that opens the message in Outlook on the web. Absent elsewhere. */
+  webLink?: string;
   labels?: string[];
   categories?: string[];
   flags: {

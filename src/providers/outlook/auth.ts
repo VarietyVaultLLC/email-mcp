@@ -167,7 +167,9 @@ export function createEncryptedFileCachePlugin(
 }
 
 export class OutlookAuth {
-  static readonly AUTHORITY = 'https://login.microsoftonline.com/consumers';
+  // 'common' signs in both personal Microsoft accounts and work or school
+  // (Microsoft 365) accounts; 'consumers' would refuse the latter.
+  static readonly AUTHORITY = 'https://login.microsoftonline.com/common';
   // MailboxSettings.ReadWrite is required for the messageRules API (block
   // rules) — confirmed by Microsoft's own docs to be supported for personal
   // Microsoft accounts (not just work/school), not just Mail.ReadWrite/Send.
@@ -200,6 +202,9 @@ export class OutlookAuth {
       codeChallenge: challenge,
       codeChallengeMethod: 'S256',
       state,
+      // Always show the account picker, so a second Microsoft account can be
+      // added while the browser is still signed in to the first one.
+      prompt: 'select_account',
     });
 
     return { url, codeVerifier: verifier, state };

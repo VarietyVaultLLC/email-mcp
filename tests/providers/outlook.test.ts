@@ -206,6 +206,25 @@ describe('OutlookAdapter', () => {
       const searchCall = (mockMessagesRequest.search as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
       expect(searchCall).toContain('subject:test subject');
       expect(searchCall).toContain('body:important content');
+      // Graph rejects $orderby together with $search.
+      expect(mockMessagesRequest.orderby).not.toHaveBeenCalled();
+    });
+
+    it('orders by received date when there is no $search', async () => {
+      const mockMessagesRequest = createMockGraphRequest({ value: [] });
+      mockApiRequests.set('/me/messages', mockMessagesRequest);
+      await adapter.connect({
+        id: 'outlook-1',
+        name: 'Test',
+        provider: 'outlook',
+        email: 'test@outlook.com',
+        oauth: { access_token: 'token', refresh_token: 'rt', expiry: '' },
+      });
+
+      await adapter.search({ since: '2026-01-01' });
+
+      expect(mockMessagesRequest.search).not.toHaveBeenCalled();
+      expect(mockMessagesRequest.orderby).toHaveBeenCalledWith('receivedDateTime desc');
     });
 
     it('maps Graph messages to Email type', async () => {
@@ -229,6 +248,8 @@ describe('OutlookAdapter', () => {
             isDraft: false,
             importance: 'normal',
             categories: ['Blue category'],
+            inferenceClassification: 'other',
+            webLink: 'https://outlook.office365.com/owa/?ItemID=msg-1',
           },
         ],
       });
@@ -254,6 +275,9 @@ describe('OutlookAdapter', () => {
       expect(results[0].flags.read).toBe(true);
       expect(results[0].flags.draft).toBe(false);
       expect(results[0].categories).toEqual(['Blue category']);
+      expect(results[0].hasAttachments).toBe(false);
+      expect(results[0].inferenceClassification).toBe('other');
+      expect(results[0].webLink).toBe('https://outlook.office365.com/owa/?ItemID=msg-1');
     });
   });
 
